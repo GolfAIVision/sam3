@@ -51,8 +51,8 @@ def _setup_tf32() -> None:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-
-_setup_tf32()
+# Note: in official repo, this happens as a side effect of importing...!
+#_setup_tf32()
 
 
 def _create_position_encoding(precompute_resolution=None):

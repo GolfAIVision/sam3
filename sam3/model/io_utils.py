@@ -37,8 +37,43 @@ def load_resource_as_video_frames(
 ):
     """
     Load video frames from either a video or an image (as a single-frame video).
-    Alternatively, if input is a list of PIL images, convert its format
+    Alternatively, if input is a list of PIL images or a numpy array, convert its format.
+
+    Args:
+        resource_path: Can be one of:
+            - str: path to a video file, image file, or image folder
+            - list[PIL.Image]: list of PIL images
+            - np.ndarray: numpy array of shape (T, H, W, 3) with dtype uint8, values in [0, 255]
     """
+    # Handle numpy array input of shape (T, H, W, 3)
+    if isinstance(resource_path, np.ndarray):
+        assert resource_path.ndim == 4 and resource_path.shape[-1] == 3, (
+            f"Expected numpy array of shape (T, H, W, 3), got {resource_path.shape}"
+        )
+        assert resource_path.dtype == np.uint8, (
+            f"Expected numpy array with dtype uint8, got {resource_path.dtype}"
+        )
+        img_mean_t = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        img_std_t = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+        num_frames, orig_height, orig_width, _ = resource_path.shape
+        images = []
+        for frame_idx in range(num_frames):
+            frame = resource_path[frame_idx]  # (H, W, 3)
+            # Resize to image_size
+            frame_pil = Image.fromarray(frame).resize((image_size, image_size))
+            img_np = np.array(frame_pil) / 255.0
+            img = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W)
+            img = img.to(dtype=torch.float16)
+            # normalize by mean and std
+            img -= img_mean_t
+            img /= img_std_t
+            images.append(img)
+        images = torch.stack(images)  # (T, 3, image_size, image_size)
+        if not offload_video_to_cpu:
+            images = images.cuda()
+        return images, orig_height, orig_width
+
     if isinstance(resource_path, list):
         img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
         img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]

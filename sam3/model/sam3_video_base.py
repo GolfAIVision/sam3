@@ -251,7 +251,7 @@ class Sam3VideoBase(nn.Module):
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
         # only GPU 0 will send outputs to the server).
         if self.rank == 0:
-            obj_id_to_mask = self.build_outputs(
+            obj_id_to_mask, obj_id_to_prob_mask = self.build_outputs(
                 frame_idx=frame_idx,
                 num_frames=num_frames,
                 reverse=reverse,
@@ -267,7 +267,7 @@ class Sam3VideoBase(nn.Module):
             )
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
-            obj_id_to_mask, obj_id_to_score = {}, {}  # dummy outputs on other GPUs
+            obj_id_to_mask, obj_id_to_prob_mask, obj_id_to_score = {}, {}, {}  # dummy outputs on other GPUs
         # a few statistics for the current frame as a part of the output
         frame_stats = {
             "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),
@@ -282,7 +282,8 @@ class Sam3VideoBase(nn.Module):
                 frame_idx
             ].update(dict(zip(tracker_obj_ids, tracker_obj_scores_global)))
         return (
-            obj_id_to_mask,  # a dict: obj_id --> output mask
+            obj_id_to_mask,  # a dict: obj_id --> output binary mask
+            obj_id_to_prob_mask,  # a dict: obj_id --> output probability mask [0, 1]
             obj_id_to_score,  # a dict: obj_id --> output score (prob)
             tracker_states_local_new,
             tracker_metadata_new,
@@ -949,7 +950,8 @@ class Sam3VideoBase(nn.Module):
     ):
         new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
         new_det_obj_ids: npt.NDArray = tracker_update_plan["new_det_obj_ids"]
-        obj_id_to_mask = {}  # obj_id --> output mask tensor
+        obj_id_to_mask = {}  # obj_id --> output binary mask tensor
+        obj_id_to_prob_mask = {}  # obj_id --> output probability mask tensor [0, 1]
 
         # Part 1: masks from previous SAM2 propagation
         existing_masklet_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
@@ -960,9 +962,13 @@ class Sam3VideoBase(nn.Module):
             align_corners=False,
         )  # (num_obj, 1, H_video, W_video)
         existing_masklet_binary = existing_masklet_video_res_masks > 0
+        existing_masklet_probs = torch.sigmoid(existing_masklet_video_res_masks)
         assert len(existing_masklet_obj_ids) == len(existing_masklet_binary)
-        for obj_id, mask in zip(existing_masklet_obj_ids, existing_masklet_binary):
+        for obj_id, mask, prob_mask in zip(
+            existing_masklet_obj_ids, existing_masklet_binary, existing_masklet_probs
+        ):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
+            obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
         # Part 2: masks from new detections
         new_det_fa_inds_t = torch.from_numpy(new_det_fa_inds)
@@ -981,9 +987,13 @@ class Sam3VideoBase(nn.Module):
         )  # (num_obj, 1, H_video, W_video)
 
         new_masklet_binary = new_masklet_video_res_masks > 0
+        new_masklet_probs = torch.sigmoid(new_masklet_video_res_masks)
         assert len(new_det_obj_ids) == len(new_masklet_video_res_masks)
-        for obj_id, mask in zip(new_det_obj_ids, new_masklet_binary):
+        for obj_id, mask, prob_mask in zip(
+            new_det_obj_ids, new_masklet_binary, new_masklet_probs
+        ):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
+            obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
         # Part 3: Override masks for reconditioned objects using detection masks
         if reconditioned_obj_ids is not None and len(reconditioned_obj_ids) > 0:
@@ -997,20 +1007,19 @@ class Sam3VideoBase(nn.Module):
                 if det_idx is not None:
                     det_mask = det_out["mask"][det_idx]
                     det_mask = det_mask.unsqueeze(0).unsqueeze(0)
-                    det_mask_resized = (
-                        F.interpolate(
-                            det_mask.float(),
-                            size=(orig_vid_height, orig_vid_width),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        > 0
+                    det_mask_video_res = F.interpolate(
+                        det_mask.float(),
+                        size=(orig_vid_height, orig_vid_width),
+                        mode="bilinear",
+                        align_corners=False,
                     )
+                    det_mask_binary = det_mask_video_res > 0
+                    det_mask_prob = torch.sigmoid(det_mask_video_res)
 
-                    det_mask_final = det_mask_resized.squeeze(0)
-                    obj_id_to_mask[obj_id] = det_mask_final
+                    obj_id_to_mask[obj_id] = det_mask_binary.squeeze(0)
+                    obj_id_to_prob_mask[obj_id] = det_mask_prob.squeeze(0)
 
-        return obj_id_to_mask
+        return obj_id_to_mask, obj_id_to_prob_mask
 
     def _get_objects_to_suppress_based_on_most_recently_occluded(
         self,
