@@ -4,7 +4,7 @@ import logging
 from collections import OrderedDict
 
 import torch
-
+from sam3.model.utils.autocast import bf16_autocast_context
 from sam3.model.sam3_tracker_base import concat_points, NO_OBJ_SCORE, Sam3TrackerBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.utils.sam2_utils import load_video_frames
@@ -45,9 +45,6 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.always_start_from_first_ann_frame = always_start_from_first_ann_frame
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
-
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()  # keep using for the entire model process
 
         self.iter_use_prev_mask_pred = True
         self.add_all_frames_to_correct_as_cond = True
@@ -1061,33 +1058,34 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         use_prev_mem_frame=True,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
-        # Retrieve correct image features
-        (
-            image,
-            _,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-        ) = self._get_image_feature(inference_state, frame_idx, batch_size)
+        with bf16_autocast_context(self.device):
+            # Retrieve correct image features
+            (
+                image,
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = self._get_image_feature(inference_state, frame_idx, batch_size)
 
-        # point and mask should not appear as input simultaneously on the same frame
-        assert point_inputs is None or mask_inputs is None
-        current_out = self.track_step(
-            frame_idx=frame_idx,
-            is_init_cond_frame=is_init_cond_frame,
-            current_vision_feats=current_vision_feats,
-            current_vision_pos_embeds=current_vision_pos_embeds,
-            feat_sizes=feat_sizes,
-            image=image,
-            point_inputs=point_inputs,
-            mask_inputs=mask_inputs,
-            output_dict=output_dict,
-            num_frames=inference_state["num_frames"],
-            track_in_reverse=reverse,
-            run_mem_encoder=run_mem_encoder,
-            prev_sam_mask_logits=prev_sam_mask_logits,
-            use_prev_mem_frame=use_prev_mem_frame,
-        )
+            # point and mask should not appear as input simultaneously on the same frame
+            assert point_inputs is None or mask_inputs is None
+            current_out = self.track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                image=image,
+                point_inputs=point_inputs,
+                mask_inputs=mask_inputs,
+                output_dict=output_dict,
+                num_frames=inference_state["num_frames"],
+                track_in_reverse=reverse,
+                run_mem_encoder=run_mem_encoder,
+                prev_sam_mask_logits=prev_sam_mask_logits,
+                use_prev_mem_frame=use_prev_mem_frame,
+            )
 
         # optionally offload the output to CPU memory to save GPU space
         storage_device = inference_state["storage_device"]
