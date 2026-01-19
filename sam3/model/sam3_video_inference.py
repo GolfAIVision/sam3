@@ -517,6 +517,9 @@ class Sam3VideoInference(Sam3VideoBase):
             "out_probs": out_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
+            "out_prob_masks": out_binary_masks.to(dtype=torch.float32)
+            .cpu()
+            .numpy(),
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
