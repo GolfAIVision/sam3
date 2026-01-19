@@ -1707,6 +1707,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
 
 def is_image_type(resource_path: str) -> bool:
+    if isinstance(resource_path, (np.ndarray, torch.Tensor)):
+        if resource_path.ndim == 3:
+            return True
+        if resource_path.ndim == 4:
+            return resource_path.shape[0] == 1
+        return False
     if isinstance(resource_path, list):
         return len(resource_path) == 1
     return resource_path.lower().endswith(tuple(IMAGE_EXTS))
