@@ -252,9 +252,9 @@ class Attention(nn.Module):
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             ).transpose(1, 2)
         else:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            # torch.backends.cuda.enable_flash_sdp(True)
+            # torch.backends.cuda.enable_math_sdp(True)
+            # torch.backends.cuda.enable_mem_efficient_sdp(True)
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
@@ -347,9 +347,9 @@ class RoPEAttention(Attention):
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             ).transpose(1, 2)
         else:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            # torch.backends.cuda.enable_flash_sdp(True)
+            # torch.backends.cuda.enable_math_sdp(True)
+            # torch.backends.cuda.enable_mem_efficient_sdp(True)
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)

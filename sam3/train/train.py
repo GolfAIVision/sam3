@@ -21,7 +21,7 @@ from sam3.train.utils.train_utils import makedir, register_omegaconf_resolvers
 from tqdm import tqdm
 
 
-os.environ["HYDRA_FULL_ERROR"] = "1"
+# os.environ["HYDRA_FULL_ERROR"] = "1"
 
 
 class SlurmEvent:
@@ -44,11 +44,11 @@ def handle_custom_resolving(cfg):
 
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(main_port)
-    os.environ["RANK"] = str(local_rank)
-    os.environ["LOCAL_RANK"] = str(local_rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
+    # os.environ["MASTER_ADDR"] = "localhost"
+    # os.environ["MASTER_PORT"] = str(main_port)
+    # os.environ["RANK"] = str(local_rank)
+    # os.environ["LOCAL_RANK"] = str(local_rank)
+    # os.environ["WORLD_SIZE"] = str(world_size)
     try:
         register_omegaconf_resolvers()
     except Exception as e:

@@ -269,22 +269,22 @@ class Trainer:
     def _setup_env_variables(self, env_variables_conf) -> None:
         if env_variables_conf is not None:
             for variable_name, value in env_variables_conf.items():
-                os.environ[variable_name] = value
+                # os.environ[variable_name] = value
 
     def _setup_torch_dist_and_backend(self, cuda_conf, distributed_conf) -> None:
         if torch.cuda.is_available():
-            torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
-            torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
-            torch.backends.cuda.matmul.allow_tf32 = (
-                cuda_conf.matmul_allow_tf32
-                if cuda_conf.matmul_allow_tf32 is not None
-                else cuda_conf.allow_tf32
-            )
-            torch.backends.cudnn.allow_tf32 = (
-                cuda_conf.cudnn_allow_tf32
-                if cuda_conf.cudnn_allow_tf32 is not None
-                else cuda_conf.allow_tf32
-            )
+            # torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
+            # torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
+            # torch.backends.cuda.matmul.allow_tf32 = (
+            #     cuda_conf.matmul_allow_tf32
+            #     if cuda_conf.matmul_allow_tf32 is not None
+            #     else cuda_conf.allow_tf32
+            # )
+            # torch.backends.cudnn.allow_tf32 = (
+            #     cuda_conf.cudnn_allow_tf32
+            #     if cuda_conf.cudnn_allow_tf32 is not None
+            #     else cuda_conf.allow_tf32
+            # )
 
         self.rank = setup_distributed_backend(
             distributed_conf.backend, distributed_conf.timeout_mins
