@@ -50,6 +50,7 @@ def _setup_tf32() -> None:
         if device_props.major >= 8:
             # torch.backends.cuda.matmul.allow_tf32 = True
             # torch.backends.cudnn.allow_tf32 = True
+            pass
 
 
 # _setup_tf32()

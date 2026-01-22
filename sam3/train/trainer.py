@@ -270,6 +270,7 @@ class Trainer:
         if env_variables_conf is not None:
             for variable_name, value in env_variables_conf.items():
                 # os.environ[variable_name] = value
+                pass
 
     def _setup_torch_dist_and_backend(self, cuda_conf, distributed_conf) -> None:
         if torch.cuda.is_available():
@@ -285,6 +286,7 @@ class Trainer:
             #     if cuda_conf.cudnn_allow_tf32 is not None
             #     else cuda_conf.allow_tf32
             # )
+            pass
 
         self.rank = setup_distributed_backend(
             distributed_conf.backend, distributed_conf.timeout_mins
