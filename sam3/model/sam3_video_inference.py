@@ -370,6 +370,7 @@ class Sam3VideoInference(Sam3VideoBase):
             # run inference for the current frame
             (
                 obj_id_to_mask,
+                obj_id_to_prob_mask,
                 obj_id_to_score,
                 tracker_states_local_new,
                 tracker_metadata_new,
@@ -404,6 +405,7 @@ class Sam3VideoInference(Sam3VideoBase):
 
         out = {
             "obj_id_to_mask": obj_id_to_mask,
+            "obj_id_to_prob_mask": obj_id_to_prob_mask,
             "obj_id_to_score": obj_id_to_score,  # first frame detection score
             "obj_id_to_tracker_score": tracker_metadata_new[
                 "obj_id_to_tracker_score_frame_wise"
@@ -435,13 +437,15 @@ class Sam3VideoInference(Sam3VideoBase):
         suppressed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
-        obj_id_to_mask = out["obj_id_to_mask"]  # low res masks
+        obj_id_to_mask = out["obj_id_to_mask"]  # binary masks
+        obj_id_to_prob_mask = out.get("obj_id_to_prob_mask", {})  # probability masks
         curr_obj_ids = sorted(obj_id_to_mask.keys())
         H_video, W_video = inference_state["orig_height"], inference_state["orig_width"]
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
+            out_prob_masks = torch.zeros(0, H_video, W_video, dtype=torch.float32)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
         else:
             out_obj_ids = torch.tensor(curr_obj_ids, dtype=torch.int64)
@@ -460,6 +464,14 @@ class Sam3VideoInference(Sam3VideoBase):
             )
             out_binary_masks = torch.cat(
                 [obj_id_to_mask[obj_id] for obj_id in curr_obj_ids], dim=0
+            )
+            # Build probability masks - use prob_mask if available, else fall back to binary
+            out_prob_masks = torch.cat(
+                [
+                    obj_id_to_prob_mask.get(obj_id, obj_id_to_mask[obj_id].float())
+                    for obj_id in curr_obj_ids
+                ],
+                dim=0,
             )
 
             assert out_binary_masks.dtype == torch.bool
@@ -486,6 +498,7 @@ class Sam3VideoInference(Sam3VideoBase):
             out_probs = torch.index_select(out_probs, 0, keep_idx)
             out_tracker_probs = torch.index_select(out_tracker_probs, 0, keep_idx)
             out_binary_masks = torch.index_select(out_binary_masks, 0, keep_idx_gpu)
+            out_prob_masks = torch.index_select(out_prob_masks, 0, keep_idx_gpu)
 
             if perflib.is_enabled:
                 out_boxes_xyxy = perf_masks_to_boxes(
@@ -517,9 +530,7 @@ class Sam3VideoInference(Sam3VideoBase):
             "out_probs": out_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
-            "out_prob_masks": out_binary_masks.to(dtype=torch.float32)
-            .cpu()
-            .numpy(),
+            "out_prob_masks": out_prob_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
