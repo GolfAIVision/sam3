@@ -22,7 +22,7 @@ from iopath.common.file_io import g_pathmgr
 
 
 # https://stackoverflow.com/q/62691279
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DEFAULT_CONTEXT_LENGTH = 77
 
 

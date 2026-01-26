@@ -39,6 +39,14 @@ def load_resource_as_video_frames(
     Load video frames from either a video or an image (as a single-frame video).
     Alternatively, if input is a list of PIL images, convert its format
     """
+    if isinstance(resource_path, (np.ndarray, torch.Tensor)):
+        return load_video_frames_from_array(
+            video_array=resource_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+        )
     if isinstance(resource_path, list):
         img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
         img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
@@ -325,6 +333,82 @@ def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60):
     if not offload_video_to_cpu:
         images = images.cuda()
     return images, video_height, video_width
+
+
+def load_video_frames_from_array(
+    video_array,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.5, 0.5, 0.5),
+    img_std=(0.5, 0.5, 0.5),
+):
+    """
+    Load video frames from a numpy array or torch tensor.
+
+    Supported shapes: (H, W, 3), (N, H, W, 3), (3, H, W), (N, 3, H, W).
+    """
+    if isinstance(video_array, np.ndarray):
+        tensor = torch.from_numpy(video_array)
+    elif isinstance(video_array, torch.Tensor):
+        tensor = video_array
+    else:
+        raise TypeError(f"Unsupported video_array type: {type(video_array)}")
+
+    if tensor.ndim == 3:
+        # Single frame
+        if tensor.shape[-1] == 3:
+            orig_height, orig_width = tensor.shape[0], tensor.shape[1]
+            tensor = tensor.unsqueeze(0).permute(0, 3, 1, 2)
+        elif tensor.shape[0] == 3:
+            orig_height, orig_width = tensor.shape[1], tensor.shape[2]
+            tensor = tensor.unsqueeze(0)
+        else:
+            raise ValueError(
+                f"Unsupported frame shape for 3D input: {tuple(tensor.shape)}"
+            )
+    elif tensor.ndim == 4:
+        if tensor.shape[-1] == 3:
+            orig_height, orig_width = tensor.shape[1], tensor.shape[2]
+            tensor = tensor.permute(0, 3, 1, 2)
+        elif tensor.shape[1] == 3:
+            orig_height, orig_width = tensor.shape[2], tensor.shape[3]
+        else:
+            raise ValueError(
+                f"Unsupported video shape for 4D input: {tuple(tensor.shape)}"
+            )
+    else:
+        raise ValueError(f"Unsupported video array rank: {tensor.ndim}")
+
+    if tensor.dtype in (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    ):
+        tensor = tensor.to(dtype=torch.float32) / 255.0
+    else:
+        tensor = tensor.to(dtype=torch.float32)
+
+    tensor = tensor.contiguous()
+    tensor = F.interpolate(
+        tensor, size=(image_size, image_size), mode="bilinear", align_corners=False
+    )
+
+    tensor = tensor.to(dtype=torch.float16)
+    img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
+    img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
+
+    if not offload_video_to_cpu:
+        tensor = tensor.cuda()
+        img_mean = img_mean.cuda()
+        img_std = img_std.cuda()
+    else:
+        tensor = tensor.cpu()
+
+    tensor -= img_mean
+    tensor /= img_std
+    return tensor, orig_height, orig_width
 
 
 def _load_img_as_tensor(img_path, image_size):

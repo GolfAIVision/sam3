@@ -299,10 +299,10 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
             logger.info(f"using the following GPU IDs: {gpus_to_use}")
             assert len(gpus_to_use) > 0 and all(isinstance(i, int) for i in gpus_to_use)
             assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
-            os.environ["RANK"] = "0"
-            os.environ["WORLD_SIZE"] = f"{len(gpus_to_use)}"
+            # os.environ["MASTER_ADDR"] = "localhost"
+            # os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
+            # os.environ["RANK"] = "0"
+            # os.environ["WORLD_SIZE"] = f"{len(gpus_to_use)}"
 
         self.gpus_to_use = gpus_to_use
         self.rank = int(os.environ["RANK"])
@@ -381,8 +381,8 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         parent_pid = os.getpid()
         for rank in range(1, world_size):
             # set the environment variables for each worker process
-            os.environ["IS_MAIN_PROCESS"] = "0"  # mark this as a worker process
-            os.environ["RANK"] = f"{rank}"
+            # os.environ["IS_MAIN_PROCESS"] = "0"  # mark this as a worker process
+            # os.environ["RANK"] = f"{rank}"
             worker_process = mp_ctx.Process(
                 target=Sam3VideoPredictorMultiGPU._worker_process_command_loop,
                 args=(
@@ -399,8 +399,8 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
             )
             worker_process.start()
         # revert the environment variables for the main process
-        os.environ["IS_MAIN_PROCESS"] = "1"
-        os.environ["RANK"] = "0"
+        # os.environ["IS_MAIN_PROCESS"] = "1"
+        # os.environ["RANK"] = "0"
         # wait for all the worker processes to load the model and collect their PIDs
         self.worker_pids = {}
         for rank in range(1, self.world_size):

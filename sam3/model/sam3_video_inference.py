@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from sam3 import perflib
 from sam3.logger import get_logger
 from sam3.model.act_ckpt_utils import clone_output_wrapper
@@ -18,6 +17,7 @@ from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
 from sam3.model.utils.misc import copy_data_to_device
+from sam3.model.utils.autocast import bf16_autocast_context
 from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 from torchvision.ops import masks_to_boxes
@@ -359,39 +359,41 @@ class Sam3VideoInference(Sam3VideoBase):
         Perform inference on a single frame and get its inference results. This would
         also update `inference_state`.
         """
-        # prepare inputs
-        input_batch = inference_state["input_batch"]
-        tracker_states_local = inference_state["tracker_inference_states"]
-        has_text_prompt = inference_state["text_prompt"] is not None
-        has_geometric_prompt = (
-            inference_state["per_frame_geometric_prompt"][frame_idx] is not None
-        )
-        # run inference for the current frame
-        (
-            obj_id_to_mask,
-            obj_id_to_score,
-            tracker_states_local_new,
-            tracker_metadata_new,
-            frame_stats,
-            _,
-        ) = self._det_track_one_frame(
-            frame_idx=frame_idx,
-            num_frames=inference_state["num_frames"],
-            reverse=reverse,
-            input_batch=input_batch,
-            geometric_prompt=(
-                inference_state["constants"]["empty_geometric_prompt"]
-                if not has_geometric_prompt
-                else inference_state["per_frame_geometric_prompt"][frame_idx]
-            ),
-            tracker_states_local=tracker_states_local,
-            tracker_metadata_prev=inference_state["tracker_metadata"],
-            feature_cache=inference_state["feature_cache"],
-            orig_vid_height=inference_state["orig_height"],
-            orig_vid_width=inference_state["orig_width"],
-            is_image_only=inference_state["is_image_only"],
-            allow_new_detections=has_text_prompt or has_geometric_prompt,
-        )
+        with bf16_autocast_context(self.device):
+            # prepare inputs
+            input_batch = inference_state["input_batch"]
+            tracker_states_local = inference_state["tracker_inference_states"]
+            has_text_prompt = inference_state["text_prompt"] is not None
+            has_geometric_prompt = (
+                inference_state["per_frame_geometric_prompt"][frame_idx] is not None
+            )
+            # run inference for the current frame
+            (
+                obj_id_to_mask,
+                obj_id_to_prob_mask,
+                obj_id_to_score,
+                tracker_states_local_new,
+                tracker_metadata_new,
+                frame_stats,
+                _,
+            ) = self._det_track_one_frame(
+                frame_idx=frame_idx,
+                num_frames=inference_state["num_frames"],
+                reverse=reverse,
+                input_batch=input_batch,
+                geometric_prompt=(
+                    inference_state["constants"]["empty_geometric_prompt"]
+                    if not has_geometric_prompt
+                    else inference_state["per_frame_geometric_prompt"][frame_idx]
+                ),
+                tracker_states_local=tracker_states_local,
+                tracker_metadata_prev=inference_state["tracker_metadata"],
+                feature_cache=inference_state["feature_cache"],
+                orig_vid_height=inference_state["orig_height"],
+                orig_vid_width=inference_state["orig_width"],
+                is_image_only=inference_state["is_image_only"],
+                allow_new_detections=has_text_prompt or has_geometric_prompt,
+            )
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new
         inference_state["tracker_metadata"] = tracker_metadata_new
@@ -403,6 +405,7 @@ class Sam3VideoInference(Sam3VideoBase):
 
         out = {
             "obj_id_to_mask": obj_id_to_mask,
+            "obj_id_to_prob_mask": obj_id_to_prob_mask,
             "obj_id_to_score": obj_id_to_score,  # first frame detection score
             "obj_id_to_tracker_score": tracker_metadata_new[
                 "obj_id_to_tracker_score_frame_wise"
@@ -434,13 +437,15 @@ class Sam3VideoInference(Sam3VideoBase):
         suppressed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
-        obj_id_to_mask = out["obj_id_to_mask"]  # low res masks
+        obj_id_to_mask = out["obj_id_to_mask"]  # binary masks
+        obj_id_to_prob_mask = out.get("obj_id_to_prob_mask", {})  # probability masks
         curr_obj_ids = sorted(obj_id_to_mask.keys())
         H_video, W_video = inference_state["orig_height"], inference_state["orig_width"]
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
+            out_prob_masks = torch.zeros(0, H_video, W_video, dtype=torch.float32)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
         else:
             out_obj_ids = torch.tensor(curr_obj_ids, dtype=torch.int64)
@@ -459,6 +464,14 @@ class Sam3VideoInference(Sam3VideoBase):
             )
             out_binary_masks = torch.cat(
                 [obj_id_to_mask[obj_id] for obj_id in curr_obj_ids], dim=0
+            )
+            # Build probability masks - use prob_mask if available, else fall back to binary
+            out_prob_masks = torch.cat(
+                [
+                    obj_id_to_prob_mask.get(obj_id, obj_id_to_mask[obj_id].float())
+                    for obj_id in curr_obj_ids
+                ],
+                dim=0,
             )
 
             assert out_binary_masks.dtype == torch.bool
@@ -485,6 +498,7 @@ class Sam3VideoInference(Sam3VideoBase):
             out_probs = torch.index_select(out_probs, 0, keep_idx)
             out_tracker_probs = torch.index_select(out_tracker_probs, 0, keep_idx)
             out_binary_masks = torch.index_select(out_binary_masks, 0, keep_idx_gpu)
+            out_prob_masks = torch.index_select(out_prob_masks, 0, keep_idx_gpu)
 
             if perflib.is_enabled:
                 out_boxes_xyxy = perf_masks_to_boxes(
@@ -516,6 +530,7 @@ class Sam3VideoInference(Sam3VideoBase):
             "out_probs": out_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
+            "out_prob_masks": out_prob_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
@@ -553,7 +568,9 @@ class Sam3VideoInference(Sam3VideoBase):
         assert (
             "cached_frame_outputs" in inference_state
             and frame_idx in inference_state["cached_frame_outputs"]
-        ), "No cached outputs found. Ensure normal propagation has run first to populate the cache."
+        ), (
+            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
+        )
         cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
         obj_id_to_mask = cached_outputs.copy()
@@ -561,9 +578,9 @@ class Sam3VideoInference(Sam3VideoBase):
         # Update with refined masks if provided
         if refined_obj_id_to_mask is not None:
             for obj_id, refined_mask in refined_obj_id_to_mask.items():
-                assert (
-                    refined_mask is not None
-                ), f"Refined mask data must be provided for obj_id {obj_id}"
+                assert refined_mask is not None, (
+                    f"Refined mask data must be provided for obj_id {obj_id}"
+                )
                 obj_id_to_mask[obj_id] = refined_mask
 
         return obj_id_to_mask
@@ -609,7 +626,7 @@ class Sam3VideoInference(Sam3VideoBase):
                 self.detector.transformer.decoder.forward,
                 fullgraph=True,
                 mode="max-autotune",
-                dynamic=False,
+                # dynamic=False,
             )
         )
 
@@ -626,7 +643,7 @@ class Sam3VideoInference(Sam3VideoBase):
             self.tracker.maskmem_backbone.forward,
             mode="max-autotune",
             fullgraph=True,
-            dynamic=False,
+            # dynamic=False,
         )
 
         self.tracker.transformer.encoder.forward = shape_logging_wrapper(
@@ -643,7 +660,7 @@ class Sam3VideoInference(Sam3VideoBase):
             self.tracker.sam_mask_decoder.forward,
             mode="max-autotune",
             fullgraph=True,
-            dynamic=False,  # Accuracy regression on True
+            # dynamic=False,  # Accuracy regression on True
         )
 
         self._model_is_compiled = True
@@ -658,12 +675,12 @@ class Sam3VideoInference(Sam3VideoBase):
         for i, thresh in enumerate(new_det_score_thresh_list):
             self.new_det_thresh = thresh
             for num_objects in num_objects_list:
-                logger.info(f"{i+1}/{num_rounds} warming up model compilation")
+                logger.info(f"{i + 1}/{num_rounds} warming up model compilation")
                 self.add_prompt(
                     inference_state, frame_idx=start_frame_idx, text_str="cat"
                 )
                 logger.info(
-                    f"{i+1}/{num_rounds} warming up model compilation -- simulating {num_objects}/{self.num_obj_for_compile} objects"
+                    f"{i + 1}/{num_rounds} warming up model compilation -- simulating {num_objects}/{self.num_obj_for_compile} objects"
                 )
                 inference_state = self.add_fake_objects_to_inference_state(
                     inference_state, num_objects, frame_idx=start_frame_idx
@@ -688,7 +705,7 @@ class Sam3VideoInference(Sam3VideoBase):
                     pass
                 self.reset_state(inference_state)
                 logger.info(
-                    f"{i+1}/{num_rounds} warming up model compilation -- completed round {i+1} out of {num_rounds}"
+                    f"{i + 1}/{num_rounds} warming up model compilation -- completed round {i + 1} out of {num_rounds}"
                 )
 
         # Warm up Tracker memory encoder with varying input shapes
@@ -852,12 +869,12 @@ class Sam3VideoInference(Sam3VideoBase):
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
         num_frames = inference_state["num_frames"]
-        assert (
-            text_str is not None or boxes_xywh is not None
-        ), "at least one type of prompt (text, boxes) must be provided"
-        assert (
-            0 <= frame_idx < num_frames
-        ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
+        assert text_str is not None or boxes_xywh is not None, (
+            "at least one type of prompt (text, boxes) must be provided"
+        )
+        assert 0 <= frame_idx < num_frames, (
+            f"{frame_idx=} is out of range for a total of {num_frames} frames"
+        )
 
         # since it's a semantic prompt, we start over
         self.reset_state(inference_state)
@@ -1198,9 +1215,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             "propagation_partial",
             "propagation_fetch",
         ]
-        assert (
-            action_type in instance_actions + propagation_actions
-        ), f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
+        assert action_type in instance_actions + propagation_actions, (
+            f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
+        )
         action = {
             "type": action_type,
             "frame_idx": frame_idx,
@@ -1368,12 +1385,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
     ):
         if points is not None:
             # Tracker instance prompts
-            assert (
-                text_str is None and boxes_xywh is None
-            ), "When points are provided, text_str and boxes_xywh must be None."
-            assert (
-                obj_id is not None
-            ), "When points are provided, obj_id must be provided."
+            assert text_str is None and boxes_xywh is None, (
+                "When points are provided, text_str and boxes_xywh must be None."
+            )
+            assert obj_id is not None, (
+                "When points are provided, obj_id must be provided."
+            )
             return self.add_tracker_new_points(
                 inference_state,
                 frame_idx,
@@ -1489,9 +1506,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 tracker_states = self._get_tracker_inference_states_by_obj_ids(
                     inference_state, [obj_id]
                 )
-                assert (
-                    len(tracker_states) == 1
-                ), f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
+                assert len(tracker_states) == 1, (
+                    f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
+                )
                 tracker_state = tracker_states[0]
 
             # log
@@ -1704,6 +1721,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
 
 def is_image_type(resource_path: str) -> bool:
+    if isinstance(resource_path, (np.ndarray, torch.Tensor)):
+        if resource_path.ndim == 3:
+            return True
+        if resource_path.ndim == 4:
+            return resource_path.shape[0] == 1
+        return False
     if isinstance(resource_path, list):
         return len(resource_path) == 1
     return resource_path.lower().endswith(tuple(IMAGE_EXTS))
