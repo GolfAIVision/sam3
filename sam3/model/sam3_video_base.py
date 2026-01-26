@@ -964,7 +964,7 @@ class Sam3VideoBase(nn.Module):
         existing_masklet_binary = existing_masklet_video_res_masks > 0
         existing_masklet_probs = torch.sigmoid(existing_masklet_video_res_masks)
         assert len(existing_masklet_obj_ids) == len(existing_masklet_binary)
-        for obj_id, mask, prob_mask in zip(existing_masklet_obj_ids, existing_masklet_binary, existing_masklet_probs):
+        for obj_id, mask, prob_mask in zip(existing_masklet_obj_ids, existing_masklet_binary, existing_masklet_probs, strict=True):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
             obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
@@ -987,7 +987,7 @@ class Sam3VideoBase(nn.Module):
         new_masklet_binary = new_masklet_video_res_masks > 0
         new_masklet_probs = torch.sigmoid(new_masklet_video_res_masks)
         assert len(new_det_obj_ids) == len(new_masklet_video_res_masks)
-        for obj_id, mask, prob_mask in zip(new_det_obj_ids, new_masklet_binary, new_masklet_probs):
+        for obj_id, mask, prob_mask in zip(new_det_obj_ids, new_masklet_binary, new_masklet_probs, strict=True):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
             obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
