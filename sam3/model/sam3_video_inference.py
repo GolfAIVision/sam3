@@ -626,7 +626,7 @@ class Sam3VideoInference(Sam3VideoBase):
                 self.detector.transformer.decoder.forward,
                 fullgraph=True,
                 mode="max-autotune",
-                dynamic=False,
+                # dynamic=False,
             )
         )
 
@@ -643,7 +643,7 @@ class Sam3VideoInference(Sam3VideoBase):
             self.tracker.maskmem_backbone.forward,
             mode="max-autotune",
             fullgraph=True,
-            dynamic=False,
+            # dynamic=False,
         )
 
         self.tracker.transformer.encoder.forward = shape_logging_wrapper(
@@ -660,7 +660,7 @@ class Sam3VideoInference(Sam3VideoBase):
             self.tracker.sam_mask_decoder.forward,
             mode="max-autotune",
             fullgraph=True,
-            dynamic=False,  # Accuracy regression on True
+            # dynamic=False,  # Accuracy regression on True
         )
 
         self._model_is_compiled = True
