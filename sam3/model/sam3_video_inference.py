@@ -35,7 +35,7 @@ class Sam3VideoInference(Sam3VideoBase):
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         compile_model=False,
-        cached_frame_outputs_window=8,
+        cached_frame_outputs_window=None,
         **kwargs,
     ):
         """
@@ -44,9 +44,9 @@ class Sam3VideoInference(Sam3VideoBase):
             If `hotstart_delay` is set to 0, this parameter is ignored.
         hotstart_dup_thresh: int, remove the object if it has overlapped with another object this many frames within its hotstart_delay period.
         cached_frame_outputs_window: int, the maximum number of recent frames whose outputs are kept in
-            `inference_state["cached_frame_outputs"]` (P1: a rolling window instead of the whole video, which is
-            only read by the interactive refinement paths, which degrade gracefully on cache misses). Set it to
-            0 (or negative) to disable caching of frame outputs entirely.
+            `inference_state["cached_frame_outputs"]`. None retains all outputs for interactive replay;
+            a positive limit opts into eviction (older interactive outputs become unavailable).
+            Zero disables caching. text_stream always disables this cache.
         """
         super().__init__(**kwargs)
         self.image_size = image_size
@@ -64,15 +64,27 @@ class Sam3VideoInference(Sam3VideoBase):
         video_loader_type="cv2",
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
-        images, orig_height, orig_width = load_resource_as_video_frames(
-            resource_path=resource_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            img_mean=self.image_mean,
-            img_std=self.image_std,
-            async_loading_frames=async_loading_frames,
-            video_loader_type=video_loader_type,
-        )
+        if self.inference_mode == "text_stream":
+            from sam3.model.text_stream import StreamingVideoFrames
+
+            images = StreamingVideoFrames(
+                resource_path,
+                self.image_size,
+                self.image_mean,
+                self.image_std,
+                self.device,
+            )
+            orig_height, orig_width = images.video_height, images.video_width
+        else:
+            images, orig_height, orig_width = load_resource_as_video_frames(
+                resource_path=resource_path,
+                image_size=self.image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=self.image_mean,
+                img_std=self.image_std,
+                async_loading_frames=async_loading_frames,
+                video_loader_type=video_loader_type,
+            )
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
@@ -90,11 +102,34 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
+        from sam3.model.text_stream import output_fields
+
+        inference_state["output_fields"] = output_fields()
+        inference_state["stream_started"] = False
+        inference_state["stream_active"] = False
         return inference_state
 
     @torch.inference_mode()
     def reset_state(self, inference_state):
         """Revert `inference_state` to what it was right after initialization."""
+        if self.inference_mode == "text_stream":
+            if inference_state.get("stream_active", False):
+                raise ValueError(
+                    "Close the active propagation before resetting the session"
+                )
+            images = inference_state["input_batch"].img_batch
+            images.reset()
+            self._construct_initial_input_batch(inference_state, images)
+            for key in (
+                "tracker_inference_states",
+                "tracker_metadata",
+                "feature_cache",
+                "cached_frame_outputs",
+                "action_history",
+            ):
+                inference_state[key].clear()
+            inference_state["stream_started"] = False
+            return
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
         for t in range(inference_state["num_frames"]):
@@ -128,21 +163,29 @@ class Sam3VideoInference(Sam3VideoBase):
         # 3) find_inputs
         input_box_embedding_dim = 258  # historical default
         input_points_embedding_dim = 257  # historical default
-        stages = [
-            FindStage(
-                img_ids=[stage_id],
-                text_ids=[0],
-                input_boxes=[torch.zeros(input_box_embedding_dim)],
-                input_boxes_mask=[torch.empty(0, dtype=torch.bool)],
-                input_boxes_label=[torch.empty(0, dtype=torch.long)],
-                input_points=[torch.empty(0, input_points_embedding_dim)],
-                input_points_mask=[torch.empty(0)],
-                object_ids=[],
+
+        def make_stage(stage_id):
+            return convert_my_tensors(
+                FindStage(
+                    img_ids=[stage_id],
+                    text_ids=[0],
+                    input_boxes=[torch.zeros(input_box_embedding_dim)],
+                    input_boxes_mask=[torch.empty(0, dtype=torch.bool)],
+                    input_boxes_label=[torch.empty(0, dtype=torch.long)],
+                    input_points=[torch.empty(0, input_points_embedding_dim)],
+                    input_points_mask=[torch.empty(0)],
+                    object_ids=[],
+                )
             )
-            for stage_id in range(num_frames)
-        ]
-        for i in range(len(stages)):
-            stages[i] = convert_my_tensors(stages[i])
+
+        from sam3.model.text_stream import LazyFrames
+
+        streaming = self.inference_mode == "text_stream"
+        stages = (
+            LazyFrames(num_frames, make_stage)
+            if streaming
+            else [make_stage(i) for i in range(num_frames)]
+        )
 
         # P6: keep the whole-video `img_batch` on CPU (pinned, so that the
         # per-frame H2D copies at the consumption sites can be async) instead of
@@ -165,8 +208,16 @@ class Sam3VideoInference(Sam3VideoBase):
             img_batch=images,
             find_text_batch=find_text_batch,
             find_inputs=stages,
-            find_targets=[None] * num_frames,
-            find_metadatas=[None] * num_frames,
+            find_targets=(
+                LazyFrames(num_frames, lambda _: None)
+                if streaming
+                else [None] * num_frames
+            ),
+            find_metadatas=(
+                LazyFrames(num_frames, lambda _: None)
+                if streaming
+                else [None] * num_frames
+            ),
         )
         inference_state["input_batch"] = input_batch
 
@@ -182,13 +233,24 @@ class Sam3VideoInference(Sam3VideoBase):
         )
 
         # constructing an output list in inference state (we start with an empty list)
-        inference_state["previous_stages_out"] = [None] * num_frames
+        inference_state["previous_stages_out"] = (
+            LazyFrames(num_frames, lambda _: None) if streaming else [None] * num_frames
+        )
         inference_state["text_prompt"] = None
-        inference_state["per_frame_raw_point_input"] = [None] * num_frames
-        inference_state["per_frame_raw_box_input"] = [None] * num_frames
-        inference_state["per_frame_visual_prompt"] = [None] * num_frames
-        inference_state["per_frame_geometric_prompt"] = [None] * num_frames
-        inference_state["per_frame_cur_step"] = [0] * num_frames
+        for key in (
+            "per_frame_raw_point_input",
+            "per_frame_raw_box_input",
+            "per_frame_visual_prompt",
+            "per_frame_geometric_prompt",
+        ):
+            inference_state[key] = (
+                LazyFrames(num_frames, lambda _: None)
+                if streaming
+                else [None] * num_frames
+            )
+        inference_state["per_frame_cur_step"] = (
+            LazyFrames(num_frames, lambda _: 0) if streaming else [0] * num_frames
+        )
 
         # placeholders for cached outputs
         # (note: currently, a single visual prompt embedding is shared for all frames)
@@ -361,6 +423,16 @@ class Sam3VideoInference(Sam3VideoBase):
                         suppressed_obj_ids,
                         unconfirmed_obj_ids,
                     )
+                    if self.inference_mode == "text_stream":
+                        # No buffered output older than this frame remains a consumer.
+                        unconfirmed_obj_ids_per_frame.pop(yield_frame_idx, None)
+                        referenced_ids = set().union(
+                            *(
+                                set(item[1]["obj_id_to_mask"])
+                                for item in hotstart_buffer + yield_list
+                            )
+                        )
+                        hotstart_removed_obj_ids.intersection_update(referenced_ids)
 
                     self._cache_frame_outputs(
                         inference_state,
@@ -379,7 +451,9 @@ class Sam3VideoInference(Sam3VideoBase):
         Perform inference on a single frame and get its inference results. This would
         also update `inference_state`.
         """
-        with bf16_autocast_context(self.device):
+        from sam3.perflib.backend import kernel_scope
+
+        with kernel_scope(self.kernel_backend), bf16_autocast_context(self.device):
             # prepare inputs
             input_batch = inference_state["input_batch"]
             tracker_states_local = inference_state["tracker_inference_states"]
@@ -447,6 +521,22 @@ class Sam3VideoInference(Sam3VideoBase):
             else:
                 out["unconfirmed_obj_ids"] = []
 
+        if self.inference_mode == "text_stream":
+            # Delayed outputs must own metadata rather than alias the rolling maps.
+            out["removed_obj_ids"] = set(out["removed_obj_ids"])
+            out["suppressed_obj_ids"] = set(out["suppressed_obj_ids"])
+            out["obj_id_to_score"] = dict(out["obj_id_to_score"])
+            from sam3.model.text_stream import prune_metadata
+
+            prune_metadata(
+                tracker_metadata_new,
+                frame_idx,
+                max(
+                    self.hotstart_delay,
+                    self.masklet_confirmation_consecutive_det_thresh,
+                ),
+            )
+
         return out
 
     def _postprocess_output(
@@ -457,6 +547,17 @@ class Sam3VideoInference(Sam3VideoBase):
         suppressed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
+        if self.inference_mode == "text_stream":
+            from sam3.perflib.stream_outputs import render_outputs
+
+            return render_outputs(
+                self,
+                inference_state,
+                out,
+                removed_obj_ids,
+                suppressed_obj_ids,
+                unconfirmed_obj_ids,
+            )
         obj_id_to_mask = out["obj_id_to_mask"]  # binary masks
         obj_id_to_prob_mask = out.get("obj_id_to_prob_mask", {})  # probability masks
         curr_obj_ids = sorted(obj_id_to_mask.keys())
@@ -488,7 +589,11 @@ class Sam3VideoInference(Sam3VideoBase):
             # Build probability masks - use prob_mask if available, else fall back to binary
             out_prob_masks = torch.cat(
                 [
-                    obj_id_to_prob_mask.get(obj_id, obj_id_to_mask[obj_id].float())
+                    (
+                        obj_id_to_prob_mask[obj_id]
+                        if obj_id in obj_id_to_prob_mask
+                        else obj_id_to_mask[obj_id].float()
+                    )
                     for obj_id in curr_obj_ids
                 ],
                 dim=0,
@@ -564,6 +669,8 @@ class Sam3VideoInference(Sam3VideoBase):
         removed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
+        if self.inference_mode == "text_stream":
+            return
         # Filter out suppressed, removed, and unconfirmed objects from the cache
         filtered_obj_id_to_mask = obj_id_to_mask.copy()
 
@@ -586,10 +693,13 @@ class Sam3VideoInference(Sam3VideoBase):
         # the `propagation_fetch` branch (degrades gracefully via `.get`), so
         # nothing else is affected.
         window = self.cached_frame_outputs_window
-        if window is None or window <= 0:
+        if window is not None and window <= 0:
             return
         cache = inference_state["cached_frame_outputs"]
+        cache.pop(frame_idx, None)
         cache[frame_idx] = filtered_obj_id_to_mask
+        if window is None:
+            return
         # keep only the `window` most recently cached frames; dicts preserve
         # insertion order, so this works for both tracking directions
         excess = len(cache) - window
@@ -609,9 +719,7 @@ class Sam3VideoInference(Sam3VideoBase):
         assert (
             "cached_frame_outputs" in inference_state
             and frame_idx in inference_state["cached_frame_outputs"]
-        ), (
-            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
-        )
+        ), "No cached outputs found. Ensure normal propagation has run first to populate the cache."
         cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
         obj_id_to_mask = cached_outputs.copy()
@@ -619,9 +727,9 @@ class Sam3VideoInference(Sam3VideoBase):
         # Update with refined masks if provided
         if refined_obj_id_to_mask is not None:
             for obj_id, refined_mask in refined_obj_id_to_mask.items():
-                assert refined_mask is not None, (
-                    f"Refined mask data must be provided for obj_id {obj_id}"
-                )
+                assert (
+                    refined_mask is not None
+                ), f"Refined mask data must be provided for obj_id {obj_id}"
                 obj_id_to_mask[obj_id] = refined_mask
 
         return obj_id_to_mask
@@ -863,6 +971,11 @@ class Sam3VideoInference(Sam3VideoBase):
         """
         if not self.compile_model:
             return
+        if self.inference_mode == "text_stream":
+            # Compilation is lazy and follows actual forward-only shapes. The
+            # legacy dummy-video warmup invokes reverse and interactive paths.
+            self._compile_model()
+            return
         self._warm_up_complete = False
         if self.device.type != "cuda":
             raise RuntimeError(
@@ -912,12 +1025,12 @@ class Sam3VideoInference(Sam3VideoBase):
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
         num_frames = inference_state["num_frames"]
-        assert text_str is not None or boxes_xywh is not None, (
-            "at least one type of prompt (text, boxes) must be provided"
-        )
-        assert 0 <= frame_idx < num_frames, (
-            f"{frame_idx=} is out of range for a total of {num_frames} frames"
-        )
+        assert (
+            text_str is not None or boxes_xywh is not None
+        ), "at least one type of prompt (text, boxes) must be provided"
+        assert (
+            0 <= frame_idx < num_frames
+        ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
         # since it's a semantic prompt, we start over
         self.reset_state(inference_state)
@@ -931,7 +1044,11 @@ class Sam3VideoInference(Sam3VideoBase):
             inference_state["text_prompt"] = None
             inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
             text_id = self.TEXT_ID_FOR_VISUAL
-        for t in range(inference_state["num_frames"]):
+        for t in (
+            range(inference_state["num_frames"])
+            if self.inference_mode != "text_stream"
+            else ()
+        ):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
 
         # 2) handle box prompt
@@ -1060,6 +1177,30 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         max_frame_num_to_track=None,
         reverse=False,
     ):
+        if self.inference_mode == "text_stream":
+            if reverse or start_frame_idx not in (None, 0):
+                raise ValueError(
+                    "text_stream supports only forward propagation from frame zero"
+                )
+            if max_frame_num_to_track is not None and max_frame_num_to_track < 0:
+                raise ValueError("max_frame_num_to_track must be nonnegative")
+            if not inference_state["text_prompt"] or inference_state["stream_started"]:
+                raise ValueError(
+                    "Add a text prompt at frame zero and propagate once; reset to restart"
+                )
+            inference_state["stream_started"] = True
+            inference_state["stream_active"] = True
+            try:
+                yield from super().propagate_in_video(
+                    inference_state, 0, max_frame_num_to_track, False
+                )
+            finally:
+                inference_state["stream_active"] = False
+                inference_state["input_batch"].img_batch.close()
+                inference_state["tracker_inference_states"].clear()
+                inference_state["feature_cache"].clear()
+                inference_state["tracker_metadata"].clear()
+            return
         # step 1: check which type of propagation to run, should be the same for all GPUs.
         propagation_type, obj_ids = self.parse_action_history_for_propagation(
             inference_state
@@ -1261,9 +1402,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             "propagation_partial",
             "propagation_fetch",
         ]
-        assert action_type in instance_actions + propagation_actions, (
-            f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
-        )
+        assert (
+            action_type in instance_actions + propagation_actions
+        ), f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
         action = {
             "type": action_type,
             "frame_idx": frame_idx,
@@ -1342,6 +1483,8 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         We try to remove object from tracker states on every GPU, it will do nothing
         for states without this object.
         """
+        if self.inference_mode == "text_stream" and is_user_action:
+            raise ValueError("text_stream does not support interactive object removal")
         obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
         assert obj_rank is not None, f"Object {obj_id} not found in any GPU."
 
@@ -1429,14 +1572,31 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         obj_id=None,
         rel_coordinates=True,
     ):
+        if self.inference_mode == "text_stream":
+            if (
+                frame_idx != 0
+                or not isinstance(text_str, str)
+                or not text_str.strip()
+                or text_str == "visual"
+                or points is not None
+                or boxes_xywh is not None
+                or obj_id is not None
+                or point_labels is not None
+                or box_labels is not None
+                or inference_state["text_prompt"] is not None
+                or inference_state["stream_started"]
+            ):
+                raise ValueError(
+                    "text_stream accepts one text prompt at frame zero; reset before changing it"
+                )
         if points is not None:
             # Tracker instance prompts
-            assert text_str is None and boxes_xywh is None, (
-                "When points are provided, text_str and boxes_xywh must be None."
-            )
-            assert obj_id is not None, (
-                "When points are provided, obj_id must be provided."
-            )
+            assert (
+                text_str is None and boxes_xywh is None
+            ), "When points are provided, text_str and boxes_xywh must be None."
+            assert (
+                obj_id is not None
+            ), "When points are provided, obj_id must be provided."
             return self.add_tracker_new_points(
                 inference_state,
                 frame_idx,
@@ -1473,6 +1633,8 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         Every GPU returns the same results, and results should contain all masks including
         these masks not refined or not added by the current user points.
         """
+        if self.inference_mode == "text_stream":
+            raise ValueError("text_stream does not support point prompts")
         assert obj_id is not None, "obj_id must be provided to add new points"
         tracker_metadata = inference_state["tracker_metadata"]
         if tracker_metadata == {}:
@@ -1552,9 +1714,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 tracker_states = self._get_tracker_inference_states_by_obj_ids(
                     inference_state, [obj_id]
                 )
-                assert len(tracker_states) == 1, (
-                    f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
-                )
+                assert (
+                    len(tracker_states) == 1
+                ), f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
                 tracker_state = tracker_states[0]
 
             # log

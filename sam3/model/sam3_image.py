@@ -6,19 +6,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
 from sam3.model.model_misc import SAM3Output
-
 from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
 from sam3.model.vl_combiner import SAM3VLBackbone
 from sam3.perflib.nms import nms_masks
-
 from sam3.train.data.collator import BatchedDatapoint
 
 from .act_ckpt_utils import activation_ckpt_wrapper
-
 from .box_ops import box_cxcywh_to_xyxy
-
 from .geometry_encoders import Prompt
 from .model_misc import inverse_sigmoid
 
@@ -117,7 +112,11 @@ class Sam3Image(torch.nn.Module):
     def _get_img_feats(self, backbone_out, img_ids):
         """Retrieve correct image features from backbone output."""
         if "backbone_fpn" in backbone_out:
-            if "id_mapping" in backbone_out and backbone_out["id_mapping"] is not None:
+            if "stream_frame_id" in backbone_out:
+                img_ids = torch.zeros_like(img_ids, device=self.device)
+            elif (
+                "id_mapping" in backbone_out and backbone_out["id_mapping"] is not None
+            ):
                 img_ids = backbone_out["id_mapping"][img_ids]
                 # If this assert fails, it likely means we're requesting different img_ids (perhaps a different frame?)
                 # We currently don't expect this to happen. We could technically trigger a recompute here,
@@ -145,7 +144,9 @@ class Sam3Image(torch.nn.Module):
         # Compute the image features on those unique image ids
         # note: we allow using a list (or other indexable types) of tensors as img_batch
         # (e.g. for async frame loading in demo). In this case we index img_batch.tensors directly
-        if isinstance(img_batch, torch.Tensor):
+        if hasattr(img_batch, "get_gpu_frame"):
+            image = img_batch.get_gpu_frame(unique_ids.item()).unsqueeze(0)
+        elif isinstance(img_batch, torch.Tensor):
             image = img_batch[unique_ids]
         elif unique_ids.numel() == 1:
             image = img_batch[unique_ids.item()].unsqueeze(0)
@@ -154,10 +155,14 @@ class Sam3Image(torch.nn.Module):
         # `img_batch` might be fp16 and offloaded to CPU
         image = image.to(dtype=torch.float32, device=self.device)
         # Next time we call this function, we want to remember which indices we computed
-        id_mapping = torch.full(
-            (len(img_batch),), -1, dtype=torch.long, device=self.device
-        )
-        id_mapping[unique_ids] = torch.arange(len(unique_ids), device=self.device)
+        if hasattr(img_batch, "get_gpu_frame"):
+            backbone_out = {**backbone_out, "stream_frame_id": unique_ids.item()}
+            id_mapping = None
+        else:
+            id_mapping = torch.full(
+                (len(img_batch),), -1, dtype=torch.long, device=self.device
+            )
+            id_mapping[unique_ids] = torch.arange(len(unique_ids), device=self.device)
         backbone_out = {
             **backbone_out,
             **self.backbone.forward_image(image),
@@ -772,7 +777,11 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             frame_idx_next_b = frame_idx_curr_b - self.world_size
         else:
             frame_idx_next_b = frame_idx_next_e = None
-        if frame_idx_next_b is not None and frame_idx_next_b not in multigpu_buffer:
+        if (
+            frame_idx_next_b is not None
+            and frame_idx_next_b not in multigpu_buffer
+            and not hasattr(backbone_out["img_batch_all_stages"], "get_gpu_frame")
+        ):
             with torch.profiler.record_function("build_multigpu_buffer_next_chunk2"):
                 self._build_multigpu_buffer_next_chunk(
                     backbone_out=backbone_out,

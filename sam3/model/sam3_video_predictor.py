@@ -14,7 +14,6 @@ from typing import List, Optional
 
 import psutil
 import torch
-
 from sam3.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,7 +33,15 @@ class Sam3VideoPredictor:
         async_loading_frames=False,
         video_loader_type="cv2",
         apply_temporal_disambiguation: bool = True,
+        *,
+        inference_mode="standard",
+        kernel_backend="auto",
+        tracker_history_frames=128,
+        max_num_objects=128,
+        compile=False,
     ):
+        self.inference_mode = inference_mode
+        self._ALL_INFERENCE_STATES = {}
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
         from sam3.model_builder import build_sam3_video_model
@@ -47,6 +54,11 @@ class Sam3VideoPredictor:
                 geo_encoder_use_img_cross_attn=geo_encoder_use_img_cross_attn,
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
+                inference_mode=inference_mode,
+                kernel_backend=kernel_backend,
+                tracker_history_frames=tracker_history_frames,
+                max_num_objects=max_num_objects,
+                compile=compile,
             )
             .cuda()
             .eval()
@@ -60,6 +72,7 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
+                output_fields=request.get("output_fields"),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -92,14 +105,17 @@ class Sam3VideoPredictor:
         if request_type == "propagate_in_video":
             yield from self.propagate_in_video(
                 session_id=request["session_id"],
-                propagation_direction=request.get("propagation_direction", "both"),
+                propagation_direction=request.get(
+                    "propagation_direction",
+                    "forward" if self.inference_mode == "text_stream" else "both",
+                ),
                 start_frame_idx=request.get("start_frame_index", None),
                 max_frame_num_to_track=request.get("max_frame_num_to_track", None),
             )
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
-    def start_session(self, resource_path, session_id=None):
+    def start_session(self, resource_path, session_id=None, output_fields=None):
         """
         Start a new inference session on an image or a video. Here `resource_path`
         can be either a path to an image file (for image inference) or an MP4 file
@@ -109,6 +125,13 @@ class Sam3VideoPredictor:
         session. If it is not defined, the start_session function will create
         a session id and return it.
         """
+        from sam3.model.text_stream import output_fields as validate_output_fields
+
+        fields = validate_output_fields(output_fields)
+        if self.inference_mode != "text_stream" and fields != validate_output_fields():
+            raise ValueError("Output selection requires inference_mode='text_stream'")
+        if session_id and session_id in self._ALL_INFERENCE_STATES:
+            raise ValueError(f"Session already exists: {session_id}")
         # get an initial inference_state from the model
         inference_state = self.model.init_state(
             resource_path=resource_path,
@@ -117,6 +140,7 @@ class Sam3VideoPredictor:
         )
         if not session_id:
             session_id = str(uuid.uuid4())
+        inference_state["output_fields"] = fields
         self._ALL_INFERENCE_STATES[session_id] = {
             "state": inference_state,
             "session_id": session_id,
@@ -167,6 +191,8 @@ class Sam3VideoPredictor:
         is_user_action: bool = True,
     ):
         """Remove an object from tracking."""
+        if self.inference_mode == "text_stream" and is_user_action:
+            raise ValueError("text_stream does not support interactive object removal")
         logger.debug(
             f"remove object {obj_id} in session {session_id}: " f"{is_user_action=}"
         )
@@ -195,10 +221,30 @@ class Sam3VideoPredictor:
         try:
             session = self._get_session(session_id)
             inference_state = session["state"]
+            if (
+                self.inference_mode == "text_stream"
+                and propagation_direction != "forward"
+            ):
+                raise ValueError("text_stream requires forward propagation")
             if propagation_direction not in ["both", "forward", "backward"]:
                 raise ValueError(
                     f"invalid propagation direction: {propagation_direction}"
                 )
+
+            if self.inference_mode == "text_stream":
+                if session.get("propagation") is not None:
+                    raise ValueError("A propagation is already active for this session")
+                stream = self.model.propagate_in_video(
+                    inference_state, start_frame_idx, max_frame_num_to_track, False
+                )
+                session["propagation"] = stream
+                try:
+                    for frame_idx, outputs in stream:
+                        yield {"frame_index": frame_idx, "outputs": outputs}
+                finally:
+                    stream.close()
+                    session.pop("propagation", None)
+                return
 
             # First doing the forward propagation
             if propagation_direction in ["both", "forward"]:
@@ -245,6 +291,12 @@ class Sam3VideoPredictor:
                 f"{self._get_session_stats()}"
             )
         else:
+            stream = session.pop("propagation", None)
+            if stream is not None:
+                stream.close()
+            images = session["state"]["input_batch"].img_batch
+            if hasattr(images, "close"):
+                images.close()
             del session
             gc.collect()
             logger.info(f"removed session {session_id}; {self._get_session_stats()}")
@@ -284,7 +336,8 @@ class Sam3VideoPredictor:
 
     def shutdown(self):
         """Shutdown the predictor and clear all sessions."""
-        self._ALL_INFERENCE_STATES.clear()
+        for session_id in list(self._ALL_INFERENCE_STATES):
+            self.close_session(session_id)
 
 
 class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):

@@ -4,11 +4,8 @@ import logging
 
 import torch
 import torch.nn.functional as F
-
 from sam3.model.memory import SimpleMaskEncoder
-
 from sam3.model.sam3_tracker_utils import get_1d_sine_pe, select_closest_cond_frames
-
 from sam3.sam.mask_decoder import MaskDecoder, MLP
 from sam3.sam.prompt_encoder import PromptEncoder
 from sam3.sam.transformer import TwoWayTransformer
@@ -527,7 +524,9 @@ class Sam3TrackerBase(torch.nn.Module):
 
         if not track_in_reverse:
             start = frame_idx - 1
-            end = 0
+            # Forward streaming has deliberately discarded older candidates.
+            # Avoid scanning the entire elapsed video through absent dict keys.
+            end = max(0, output_dict.get("non_cond_frame_min_idx", 1) - 1)
             step = -r
             must_include = frame_idx - 1
         else:

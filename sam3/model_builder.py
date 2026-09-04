@@ -655,6 +655,9 @@ def build_sam3_video_model(
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
     apply_temporal_disambiguation: bool = True,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    compile=False,
+    *,
     # W4: cap on the number of tracked objects (masklets) across all GPUs; new
     # detections are dropped by score once the cap is hit. The previous
     # effective default was unlimited (10000), which unbounded the tracker
@@ -670,8 +673,9 @@ def build_sam3_video_model(
     # bounds conditioning state at the first cond frame plus the K newest
     # (K = max_cond_frames_in_attn + 2) per tracker state.
     prune_tracker_cond_outputs=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    compile=False,
+    inference_mode="standard",
+    kernel_backend="auto",
+    tracker_history_frames=128,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -750,6 +754,9 @@ def build_sam3_video_model(
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
+            inference_mode=inference_mode,
+            kernel_backend=kernel_backend,
+            tracker_history_frames=tracker_history_frames,
             num_obj_for_compile=num_obj_for_compile,
             prune_tracker_cond_outputs=prune_tracker_cond_outputs,
             image_size=1008,
@@ -780,6 +787,9 @@ def build_sam3_video_model(
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
+            inference_mode=inference_mode,
+            kernel_backend=kernel_backend,
+            tracker_history_frames=tracker_history_frames,
             num_obj_for_compile=num_obj_for_compile,
             prune_tracker_cond_outputs=prune_tracker_cond_outputs,
             image_size=1008,
@@ -810,6 +820,18 @@ def build_sam3_video_model(
 
 
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
+    if model_kwargs.get("inference_mode") == "text_stream":
+        import os
+
+        from sam3.model.sam3_video_predictor import Sam3VideoPredictor
+
+        if int(os.getenv("WORLD_SIZE", "1")) != 1 or int(os.getenv("RANK", "0")) != 0:
+            raise ValueError(
+                "text_stream requires one GPU per process, without distributed ranks"
+            )
+        if gpus_to_use not in (None, [0]):
+            raise ValueError("Select the text_stream GPU using CUDA_VISIBLE_DEVICES")
+        return Sam3VideoPredictor(*model_args, **model_kwargs)
     return Sam3VideoPredictorMultiGPU(
         *model_args, gpus_to_use=gpus_to_use, **model_kwargs
     )

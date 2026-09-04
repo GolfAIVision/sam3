@@ -1,5 +1,11 @@
 # sam3 memory optimization plan (long-video det-track on 24 GB GPUs)
 
+> Historical branch plan. The implemented forward-only text-stream mode, current
+> retention rules, kernel dispatch, and measured results are documented in
+> [TEXT_STREAM.md](TEXT_STREAM.md). In particular, standard interactive mode now
+> retains full historical outputs, while text-stream mode uses bounded deletion
+> rather than the slim-entry archive described below.
+
 Grounded in a measured failure: video det-track with a text prompt on ~1100-frame
 1936x1472 videos grows ~11.06 MiB/frame on GPU and OOMs a 24 GB card around frame ~970
 (22.1 GiB allocated). The ledger at that point: 3.36 GiB weights + 6.32 GiB whole-video

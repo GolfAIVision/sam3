@@ -4,9 +4,9 @@ import logging
 from collections import OrderedDict
 
 import torch
-from sam3.model.utils.autocast import bf16_autocast_context
 from sam3.model.sam3_tracker_base import concat_points, NO_OBJ_SCORE, Sam3TrackerBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
+from sam3.model.utils.autocast import bf16_autocast_context
 from sam3.model.utils.sam2_utils import load_video_frames
 from tqdm.auto import tqdm
 
@@ -1140,6 +1140,10 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         if self.use_memory_selection:
             compact_current_out["iou_score"] = current_out["iou_score"]
             compact_current_out["eff_iou_score"] = current_out["eff_iou_score"]
+            if inference_state.get("cpu_selection_scores", False):
+                compact_current_out["eff_iou_score"] = float(
+                    compact_current_out["eff_iou_score"]
+                )
         return compact_current_out, pred_masks_gpu
 
     def _run_memory_encoder(
@@ -1300,6 +1304,9 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                         out["maskmem_pos_enc"] = [
                             x[remain_old_obj_inds] for x in out["maskmem_pos_enc"]
                         ]
+                        out["maskmem_pos_enc"] = self._get_maskmem_pos_enc(
+                            inference_state, out
+                        )
                     self._add_output_per_object(
                         inference_state, frame_idx, out, storage_key
                     )
@@ -1320,6 +1327,8 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                     out["eff_iou_score"] = self.cal_mem_score(
                         out["object_score_logits"], out["iou_score"]
                     )  # recalculate the memory frame score
+                    if inference_state.get("cpu_selection_scores", False):
+                        out["eff_iou_score"] = float(out["eff_iou_score"])
                 # also update the per-object slices
                 self._add_output_per_object(
                     inference_state, frame_idx, out, storage_key

@@ -35,7 +35,10 @@ def associate_det_trk(
 
         if list(det_masks.shape[-2:]) != list(track_masks.shape[-2:]):
             # resize to the smaller size to save GPU memory
-            if torch.numel(det_masks[-2:]) < torch.numel(track_masks[-2:]):
+            if (
+                det_masks.shape[-2] * det_masks.shape[-1]
+                < track_masks.shape[-2] * track_masks.shape[-1]
+            ):
                 track_masks = (
                     F.interpolate(
                         track_masks.unsqueeze(1).float(),
@@ -61,14 +64,12 @@ def associate_det_trk(
         track_masks = track_masks > 0
 
         iou = mask_iou(det_masks, track_masks)  # (N, M)
-        igeit = iou >= iou_threshold
-        igeit_any_dim_1 = igeit.any(dim=1)
-        igeit_trk = iou >= iou_threshold_trk
 
-        iou_list = iou.cpu().numpy().tolist()
-        igeit_list = igeit.cpu().numpy().tolist()
-        igeit_any_dim_1_list = igeit_any_dim_1.cpu().numpy().tolist()
-        igeit_trk_list = igeit_trk.cpu().numpy().tolist()
+        iou_cpu = iou.cpu().numpy()
+        iou_list = iou_cpu.tolist()
+        igeit_list = (iou_cpu >= iou_threshold).tolist()
+        igeit_any_dim_1_list = (iou_cpu >= iou_threshold).any(axis=1).tolist()
+        igeit_trk_list = (iou_cpu >= iou_threshold_trk).tolist()
 
         det_scores_list = (
             det_scores
@@ -84,7 +85,7 @@ def associate_det_trk(
             return list(range(det_masks.size(0))), [], {}
 
         # Hungarian matching: maximize IoU for tracks
-        cost_matrix = 1 - iou.cpu().numpy()  # Hungarian solves for minimum cost
+        cost_matrix = 1 - iou_cpu  # Hungarian solves for minimum cost
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         def branchy_hungarian_better_uses_the_cpu(
@@ -109,13 +110,14 @@ def associate_det_trk(
 
             # For detections: allow many tracks to match to the same detection (many-to-one)
             # So, a detection is 'new' if it does not match any track above threshold
-            assert track_masks.size(0) == igeit.size(
-                1
-            )  # Needed for loop optimizaiton below
+            assert track_masks.size(0) == iou.size(1)
             new_det_indices = []
             for d in range(det_masks.size(0)):
                 if not igeit_any_dim_1_list[d]:
-                    if det_scores is not None and det_scores[d] >= new_det_thresh:
+                    if (
+                        det_scores_list is not None
+                        and det_scores_list[d] >= new_det_thresh
+                    ):
                         new_det_indices.append(d)
 
             # for each detection, which tracks it matched to (above threshold)

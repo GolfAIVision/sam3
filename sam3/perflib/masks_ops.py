@@ -55,12 +55,26 @@ def mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
       - ious: (N, M) float Tensor, containing IoUs for each pair of predicted and ground truth masks
     """
     assert pred_masks.dtype == gt_masks.dtype == torch.bool
+    if pred_masks.device != gt_masks.device:
+        raise ValueError("mask_iou inputs must be on the same device")
+    if (
+        pred_masks.ndim != 3
+        or gt_masks.ndim != 3
+        or pred_masks.shape[1:] != gt_masks.shape[1:]
+    ):
+        raise ValueError("mask_iou requires masks with matching spatial dimensions")
+    from sam3.perflib.backend import use_triton
+
+    if use_triton(pred_masks) and pred_masks.shape[1] * pred_masks.shape[2] > 0:
+        from sam3.perflib.triton.mask_iou import mask_iou_triton
+
+        return mask_iou_triton(pred_masks, gt_masks)
     N, H, W = pred_masks.shape
     M, _, _ = gt_masks.shape
 
     # Flatten masks: (N, 1, H*W) and (1, M, H*W)
-    pred_flat = pred_masks.view(N, 1, H * W)
-    gt_flat = gt_masks.view(1, M, H * W)
+    pred_flat = pred_masks.reshape(N, 1, H * W)
+    gt_flat = gt_masks.reshape(1, M, H * W)
 
     # Compute intersection and union: (N, M)
     intersection = (pred_flat & gt_flat).sum(dim=2).float()

@@ -14,7 +14,6 @@ import numpy.typing as npt
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from sam3 import perflib
 from sam3.logger import get_logger
 from sam3.model.box_ops import fast_diag_box_iou
@@ -69,6 +68,9 @@ class Sam3VideoBase(nn.Module):
         fill_hole_area=16,
         # The maximum number of objects (masklets) to track across all GPUs (for no limit, set it to -1)
         max_num_objects=-1,
+        inference_mode="standard",
+        kernel_backend="auto",
+        tracker_history_frames=128,
         # Number of objects used to warm up torch.compile (W4: decoupled from
         # `max_num_objects` so that raising the object cap does not inflate the
         # compilation warm-up; when None, it is derived from `max_num_objects`,
@@ -131,6 +133,33 @@ class Sam3VideoBase(nn.Module):
         self.eval()
         self.rank = int(os.getenv("RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
+        if inference_mode not in ("standard", "text_stream"):
+            raise ValueError(f"Unknown inference mode: {inference_mode}")
+        if inference_mode == "text_stream" and max_num_objects <= 0:
+            raise ValueError("text_stream requires a positive max_num_objects cap")
+        if kernel_backend not in ("auto", "torch", "triton", "cuda"):
+            raise ValueError(f"Unknown kernel backend: {kernel_backend}")
+        if kernel_backend == "cuda":
+            raise ValueError(
+                "No custom CUDA backend has passed the performance gate; use torch or triton"
+            )
+        if tracker_history_frames is not None and not isinstance(
+            tracker_history_frames, int
+        ):
+            raise ValueError("tracker_history_frames must be an integer or None")
+        if tracker_history_frames is not None and tracker_history_frames < max(
+            tracker.num_maskmem + 2, tracker.max_obj_ptrs_in_encoder
+        ):
+            raise ValueError(
+                "Tracker history must cover the mask-memory and pointer horizons"
+            )
+        if inference_mode == "text_stream" and (self.rank != 0 or self.world_size != 1):
+            raise ValueError("text_stream requires a single GPU process")
+        self.inference_mode = inference_mode
+        self.kernel_backend = (
+            kernel_backend if inference_mode == "text_stream" else "torch"
+        )
+        self.tracker_history_frames = tracker_history_frames
         self._dist_pg_cpu = None  # CPU process group (lazy-initialized on first use)
 
         # the maximum object number
@@ -289,7 +318,11 @@ class Sam3VideoBase(nn.Module):
             )
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
-            obj_id_to_mask, obj_id_to_prob_mask, obj_id_to_score = {}, {}, {}  # dummy outputs on other GPUs
+            obj_id_to_mask, obj_id_to_prob_mask, obj_id_to_score = (
+                {},
+                {},
+                {},
+            )  # dummy outputs on other GPUs
         # a few statistics for the current frame as a part of the output
         frame_stats = {
             "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),
@@ -306,14 +339,20 @@ class Sam3VideoBase(nn.Module):
 
         # P2: prune tracker non-conditioning outputs that fell out of the memory
         # window, across all tracker states (see `_prune_tracker_non_cond_outputs`)
-        self._prune_tracker_non_cond_outputs(
-            tracker_states_local_new, frame_idx, reverse
-        )
+        if self.inference_mode == "text_stream":
+            from sam3.model.text_stream import prune_tracker_states
+
+            prune_tracker_states(
+                tracker_states_local_new, frame_idx, self.tracker_history_frames
+            )
         # P3 (opt-in): prune tracker conditioning outputs that fell out of the
         # obj-ptr selection horizon, across all tracker states (see
         # `_prune_tracker_cond_outputs`). Default-off: this is a no-op unless
         # `prune_tracker_cond_outputs` was enabled at construction.
-        if self.prune_tracker_cond_outputs:
+        if self.prune_tracker_cond_outputs or (
+            self.inference_mode == "text_stream"
+            and self.tracker_history_frames is not None
+        ):
             self._prune_tracker_cond_outputs(
                 tracker_states_local_new, frame_idx, reverse
             )
@@ -742,7 +781,13 @@ class Sam3VideoBase(nn.Module):
         # `_get_image_feature` and feeds it to the memory encoder, which requires
         # it on the GPU.
         feature_cache[frame_idx] = (
-            input_batch.img_batch[frame_idx].to(device=self.device, non_blocking=True),
+            (
+                input_batch.img_batch.get_gpu_frame(frame_idx)
+                if self.inference_mode == "text_stream"
+                else input_batch.img_batch[frame_idx].to(
+                    device=self.device, non_blocking=True
+                )
+            ),
             backbone_cache,
         )
         # remove from `feature_cache` old features to save GPU memory
@@ -1303,6 +1348,33 @@ class Sam3VideoBase(nn.Module):
         obj_id_to_mask = {}  # obj_id --> output mask tensor
         obj_id_to_prob_mask = {}  # obj_id --> output prob mask tensor
 
+        if self.inference_mode == "text_stream":
+            # Keep compact logits through the hot-start delay; render at yield time.
+            for obj, mask in zip(
+                tracker_metadata_prev["obj_ids_all_gpu"],
+                tracker_low_res_masks_global,
+                strict=True,
+            ):
+                obj_id_to_mask[obj] = mask.unsqueeze(0).clone()
+            new_masks = det_out["mask"][torch.from_numpy(new_det_fa_inds)].unsqueeze(1)
+            new_masks = fill_holes_in_mask_scores(
+                new_masks,
+                max_area=self.fill_hole_area,
+                fill_holes=True,
+                remove_sprinkles=True,
+            )
+            for obj, mask in zip(new_det_obj_ids, new_masks, strict=True):
+                obj_id_to_mask[obj] = mask.clone()
+            for obj in reconditioned_obj_ids or ():
+                index = tracker_update_plan.get(
+                    "trk_id_to_max_iou_high_conf_det", {}
+                ).get(obj)
+                if index is not None:
+                    obj_id_to_mask[obj] = (
+                        det_out["mask"][index].float().unsqueeze(0).clone()
+                    )
+            return obj_id_to_mask, obj_id_to_prob_mask
+
         # Part 1: masks from previous SAM2 propagation
         existing_masklet_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
         existing_masklet_video_res_masks = F.interpolate(
@@ -1314,7 +1386,12 @@ class Sam3VideoBase(nn.Module):
         existing_masklet_binary = existing_masklet_video_res_masks > 0
         existing_masklet_probs = torch.sigmoid(existing_masklet_video_res_masks)
         assert len(existing_masklet_obj_ids) == len(existing_masklet_binary)
-        for obj_id, mask, prob_mask in zip(existing_masklet_obj_ids, existing_masklet_binary, existing_masklet_probs, strict=True):
+        for obj_id, mask, prob_mask in zip(
+            existing_masklet_obj_ids,
+            existing_masklet_binary,
+            existing_masklet_probs,
+            strict=True,
+        ):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
             obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
@@ -1337,7 +1414,9 @@ class Sam3VideoBase(nn.Module):
         new_masklet_binary = new_masklet_video_res_masks > 0
         new_masklet_probs = torch.sigmoid(new_masklet_video_res_masks)
         assert len(new_det_obj_ids) == len(new_masklet_video_res_masks)
-        for obj_id, mask, prob_mask in zip(new_det_obj_ids, new_masklet_binary, new_masklet_probs, strict=True):
+        for obj_id, mask, prob_mask in zip(
+            new_det_obj_ids, new_masklet_binary, new_masklet_probs, strict=True
+        ):
             obj_id_to_mask[obj_id] = mask  # (1, H_video, W_video)
             obj_id_to_prob_mask[obj_id] = prob_mask  # (1, H_video, W_video)
 
@@ -1711,7 +1790,11 @@ class Sam3VideoBase(nn.Module):
                 self.max_trk_keep_alive, trk_keep_alive[obj_id] + 1
             )
         for obj_id in unmatched_trk_obj_ids:
-            unmatched_frame_inds[obj_id].append(frame_idx)
+            if (
+                self.inference_mode != "text_stream"
+                or len(unmatched_frame_inds[obj_id]) < self.hotstart_unmatch_thresh
+            ):
+                unmatched_frame_inds[obj_id].append(frame_idx)
             # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the min value of trk_keep_alive
             # The max keep alive is 2x the min, means the model prefers to keep the prediction rather than suppress it if it was matched long enough.
             trk_keep_alive[obj_id] = max(
@@ -1769,7 +1852,12 @@ class Sam3VideoBase(nn.Module):
             for obj_id in matched_trk_obj_ids:
                 if obj_id != first_appear_obj_id:
                     key = (first_appear_obj_id, obj_id)
-                    overlap_pair_to_frame_inds[key].append(frame_idx)
+                    if (
+                        self.inference_mode != "text_stream"
+                        or len(overlap_pair_to_frame_inds[key])
+                        < self.hotstart_dup_thresh
+                    ):
+                        overlap_pair_to_frame_inds[key].append(frame_idx)
 
         # b) remove a masklet if it first appears after `hotstart_diff` and it overlaps with another
         # masklet (that appears earlier) for more than `self.hotstart_dup_thresh` frames
@@ -1896,6 +1984,7 @@ class Sam3VideoBase(nn.Module):
             num_frames=num_frames,
             offload_state_to_cpu=self.offload_tracker_state_to_cpu,
         )
+        new_tracker_state["cpu_selection_scores"] = self.inference_mode == "text_stream"
         new_tracker_state["backbone_out"] = (
             prev_tracker_state.get("backbone_out", None)
             if prev_tracker_state is not None
