@@ -581,9 +581,10 @@ class Sam3VideoInference(Sam3VideoBase):
                     del filtered_obj_id_to_mask[obj_id]
 
         # P1: cap the output cache with a rolling window (or disable it entirely).
-        # The cache is only read by the interactive refinement paths
-        # (`_build_tracker_output` and the `propagation_fetch` branch), which both
-        # handle cache misses gracefully, so nothing else is affected.
+        # The cache is only read by the interactive refinement paths:
+        # `_build_tracker_output` (loud assert on a cache miss, per design) and
+        # the `propagation_fetch` branch (degrades gracefully via `.get`), so
+        # nothing else is affected.
         window = self.cached_frame_outputs_window
         if window is None or window <= 0:
             return
@@ -814,7 +815,9 @@ class Sam3VideoInference(Sam3VideoBase):
             feature_cache=inference_state["feature_cache"],
         )
 
-        # Synthesize obj_id_to_mask data for cached_frame_outputs to support _build_tracker_output during warmup
+        # Synthesize obj_id_to_mask data to populate cached_frame_outputs during
+        # warmup, exercising the same `_cache_frame_outputs` write path (incl.
+        # the P1 rolling window) that normal propagation uses
         obj_id_to_mask = {}
         if num_objects > 0:
             H_video = inference_state["orig_height"]
