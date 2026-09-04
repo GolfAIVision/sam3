@@ -329,6 +329,13 @@ class Sam3VideoBase(nn.Module):
         O(video). Conditioning (`cond_frame_outputs`) entries are left untouched.
         Stale `consolidated_frame_inds` entries of pruned frames are discarded so
         the tracker's propagation never looks up a pruned output.
+
+        Accepted caveat (controller decision; OPTIMIZATION_PLAN.md patch P2):
+        re-propagating in the REVERSE direction after a forward pass reads
+        forward-era memories pruned by the forward pass in its first frames, so
+        mixed-direction runs may drift vs unbounded memory. This is accepted for
+        the long-video memory optimization; forward-only det-track remains
+        bit-identical to the unpruned baseline.
         """
         # cover both the memory-attention window (num_maskmem) and the obj-ptr
         # selection horizon (max_obj_ptrs_in_encoder), plus a small margin
