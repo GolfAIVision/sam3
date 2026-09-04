@@ -1032,11 +1032,14 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         )
 
     def _init_new_tracker_state(self, inference_state):
+        # P4: offload the tracker state to CPU memory (storage_device=cpu); the
+        # tracker re-uploads memories when they are read by the memory attention.
         return self.tracker.init_state(
             cached_features=inference_state["feature_cache"],
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=self.offload_tracker_state_to_cpu,
         )
 
     @torch.inference_mode()

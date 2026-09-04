@@ -69,6 +69,11 @@ class Sam3VideoBase(nn.Module):
         fill_hole_area=16,
         # The maximum number of objects (masklets) to track across all GPUs (for no limit, set it to -1)
         max_num_objects=-1,
+        # P4: whether to offload the tracker inference states to CPU memory
+        # (maskmem features and predicted masks are stored on the host and
+        # re-uploaded when read by the memory attention, which already handles
+        # CPU-resident memories). Saves GPU memory at a small fps cost.
+        offload_tracker_state_to_cpu=True,
         recondition_every_nth_frame=-1,
         # masket confirmation status (to suppress unconfirmed masklets)
         masklet_confirmation_enable=False,
@@ -124,6 +129,7 @@ class Sam3VideoBase(nn.Module):
         logger.info(f"setting {max_num_objects=} and {num_obj_for_compile=}")
         self.max_num_objects = max_num_objects
         self.num_obj_for_compile = num_obj_for_compile
+        self.offload_tracker_state_to_cpu = offload_tracker_state_to_cpu
         self.recondition_every_nth_frame = recondition_every_nth_frame
         self.masklet_confirmation_enable = masklet_confirmation_enable
         self.masklet_confirmation_consecutive_det_thresh = (
@@ -1598,11 +1604,14 @@ class Sam3VideoBase(nn.Module):
         # prepare inference_state
         # batch objects that first appear on the same frame together
         # Clear inference state. Keep the cached image features if available.
+        # P4: offload the tracker state to CPU memory (storage_device=cpu); the
+        # tracker re-uploads memories when they are read by the memory attention.
         new_tracker_state = self.tracker.init_state(
             cached_features=feature_cache,
             video_height=orig_vid_height,
             video_width=orig_vid_width,
             num_frames=num_frames,
+            offload_state_to_cpu=self.offload_tracker_state_to_cpu,
         )
         new_tracker_state["backbone_out"] = (
             prev_tracker_state.get("backbone_out", None)
