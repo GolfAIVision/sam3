@@ -79,6 +79,14 @@ class Sam3VideoBase(nn.Module):
         # re-uploaded when read by the memory attention, which already handles
         # CPU-resident memories). Saves GPU memory at a small fps cost.
         offload_tracker_state_to_cpu=True,
+        # P3: whether to prune stale tracker conditioning-frame outputs
+        # (`cond_frame_outputs`) that fell out of the obj-ptr selection
+        # horizon, keeping the first cond frame plus the K newest (K =
+        # `max_cond_frames_in_attn` + 2, derived from `self.tracker`). The
+        # default None keeps the legacy unbounded conditioning memory
+        # (bit-identical); True opts in to bounded conditioning state (see
+        # `_prune_tracker_cond_outputs`).
+        prune_tracker_cond_outputs=None,
         recondition_every_nth_frame=-1,
         # masket confirmation status (to suppress unconfirmed masklets)
         masklet_confirmation_enable=False,
@@ -137,6 +145,7 @@ class Sam3VideoBase(nn.Module):
         self.max_num_objects = max_num_objects
         self.num_obj_for_compile = num_obj_for_compile
         self.offload_tracker_state_to_cpu = offload_tracker_state_to_cpu
+        self.prune_tracker_cond_outputs = prune_tracker_cond_outputs
         self.recondition_every_nth_frame = recondition_every_nth_frame
         self.masklet_confirmation_enable = masklet_confirmation_enable
         self.masklet_confirmation_consecutive_det_thresh = (
@@ -300,6 +309,14 @@ class Sam3VideoBase(nn.Module):
         self._prune_tracker_non_cond_outputs(
             tracker_states_local_new, frame_idx, reverse
         )
+        # P3 (opt-in): prune tracker conditioning outputs that fell out of the
+        # obj-ptr selection horizon, across all tracker states (see
+        # `_prune_tracker_cond_outputs`). Default-off: this is a no-op unless
+        # `prune_tracker_cond_outputs` was enabled at construction.
+        if self.prune_tracker_cond_outputs:
+            self._prune_tracker_cond_outputs(
+                tracker_states_local_new, frame_idx, reverse
+            )
         return (
             obj_id_to_mask,  # a dict: obj_id --> output mask
             obj_id_to_prob_mask,  # a dict: obj_id --> output prob mask
@@ -434,6 +451,187 @@ class Sam3VideoBase(nn.Module):
             ]
             for stale_frame_idx in newly_stale_frame_inds:
                 consolidated_inds.discard(stale_frame_idx)
+
+    def _prune_tracker_cond_outputs(
+        self, tracker_states_local: List[Any], frame_idx: int, reverse: bool
+    ):
+        """
+        P3 (opt-in, gated by the `prune_tracker_cond_outputs` constructor
+        flag): rolling-window prune of the tracker's conditioning frame
+        outputs.
+
+        After each tracked frame, DELETE `cond_frame_outputs` entries -- together
+        with their per-object mirrors in `output_dict_per_obj`, their stale
+        `consolidated_frame_inds["cond_frame_outputs"]` bookkeeping, and any
+        point/mask inputs registered on those frames -- that fall outside a
+        one-sided horizon of `max_obj_ptrs_in_encoder` frames behind the
+        current frame in the tracking direction, across ALL tracker states
+        (the det-track path maintains a list of states), while always keeping
+
+        - the FIRST conditioning frame of the state (insertion order; the
+          prompt / annotation frame that started tracking), and
+        - the `K` conditioning frames closest to the tracking front, where
+          `K = max_cond_frames_in_attn + 2` (6 with the shipped
+          `max_cond_frames_in_attn=4`; closest = largest frame index when
+          tracking forwards, smallest when tracking backwards, which under
+          the monotone det-track growth coincides with the K most recently
+          added).
+
+        Unlike the P2 non-cond prune (which slims entries in place), the cond
+        prune deletes whole entries: conditioning outputs are consumed by no
+        propagation path other than the readers enumerated below, so a stale
+        entry carries no reusable metadata.
+
+        Default-off bit-identity: with `prune_tracker_cond_outputs=None`
+        (default) this method is never called and the legacy unbounded
+        `cond_frame_outputs` behavior is preserved exactly.
+
+        Opt-in forward bit-identity by construction -- the forward det-track
+        pass reads conditioning state only through:
+
+        - `select_closest_cond_frames` (sam3_tracker_utils.py:270-319), called
+          from `_prepare_memory_conditioned_features`
+          (sam3_tracker_base.py:560-787) with
+          `max_cond_frames_in_attn`: it selects at most
+          `max_cond_frames_in_attn` cond frames temporally closest to the
+          current frame. Tracking forwards, every cond frame of a state lies
+          at/below the current frame (reconditioning and new-object
+          conditioning are added after the frame's propagation), so the
+          selected frames are the `max_cond_frames_in_attn` largest indices --
+          always inside the kept K newest. The selected frames feed both the
+          mask-attention window (`maskmem_features` / `maskmem_pos_enc`) and
+          the obj-ptr loop (`obj_ptr`).
+        - the unselected-cond fallbacks: the mask-attention window looks back
+          `num_maskmem - 1` frames (sam3_tracker_base.py:645-656) and the
+          obj-ptr loop falls back to unselected cond frames only within
+          `min(num_frames, max_obj_ptrs_in_encoder) - 1` frames of the current
+          frame (sam3_tracker_base.py:724-739). Both horizons are strictly
+          inside the prune horizon `max_obj_ptrs_in_encoder`, so no pruned
+          entry is ever read on the forward pass.
+        - the non-empty guards: `propagate_in_video` raises on empty
+          conditioning outputs (sam3_tracking_predictor.py:809) and
+          `_prepare_memory_conditioned_features` asserts the same
+          (sam3_tracker_base.py:591); the keep-first and never-prune-nonempty
+          invariants below keep conditioning outputs non-empty. The predictor
+          also derives `first_ann_frame_idx` and its default propagation
+          start from the cond keys (sam3_tracking_predictor.py:745-766),
+          which keep-first protects.
+        - the state-bookkeeping invariants: deleting a cond entry requires
+          dropping its `consolidated_frame_inds["cond_frame_outputs"]` entry
+          (the predictor asserts these inds are a subset of the cond keys,
+          sam3_tracking_predictor.py:724-726) and its registered point/mask
+          inputs (`propagate_in_video_preflight` asserts
+          `consolidated_frame_inds == frames with point/mask inputs`,
+          sam3_tracking_predictor.py:728-739). The dropped inputs were
+          consumed when the pruned cond frames' memories were encoded and are
+          read by no forward det-track path (input dicts are only read for
+          the current interaction frame, by the preflight bookkeeping assert,
+          and by the interactive refinement / object-removal paths).
+
+        Residual risks accepted by the plan's P3 quality gate (the flag is
+        opt-in and default-off): (1) reverse re-propagation composition -- in
+        the backwards direction the temporally-closest conditioning selection
+        can reach beyond the kept set on sparse conditioning timelines, so
+        mixed-direction sessions may compose memories differently than
+        unbounded ones; (2) interactive refinement on pruned cond frames --
+        the `clear_all_points_in_frame` downgrade and re-propagation over a
+        consolidated cond frame (sam3_tracking_predictor.py:719-766,
+        :932-1001) operate on the surviving entries only. Both warrant a
+        tracking-quality metric (HOTA/MOTA) before enabling the flag in
+        production (see OPTIMIZATION_PLAN.md, P3 addendum).
+
+        Scaling: conditioning outputs are the dominant unbounded state on
+        long det-track runs -- the real-testset baseline grows one cond event
+        per state every `recondition_every_nth_frame` frames (keys
+        [0, 16, 32, 48] after 64 frames) at ~1.9 MiB GPU (`pred_masks`,
+        `obj_ptr`, logits) plus ~2.85 MiB host (`maskmem_features`, offloaded
+        by `offload_tracker_state_to_cpu=True`) per event. With the flag on,
+        conditioning state is bounded at 1 + K events per state.
+        """
+        max_cond_frame_num = self.tracker.max_cond_frames_in_attn
+        if max_cond_frame_num < 0:
+            # unbounded conditioning-frame selection: `select_closest_cond_frames`
+            # would keep ALL cond frames, so no prune horizon is safe
+            return
+        # keep the up-to-`max_cond_frame_num` cond frames the memory attention
+        # may select, plus a small margin for cond frames added between
+        # consecutive prune calls and for the keep-first selection pinning
+        num_newest_to_keep = max_cond_frame_num + 2
+        # the obj-ptr loop and the mask-attention window never read cond
+        # entries more than `max_obj_ptrs_in_encoder - 1` frames behind the
+        # current frame, so anything strictly beyond this horizon is unread
+        horizon = self.tracker.max_obj_ptrs_in_encoder
+        for tracker_state in tracker_states_local:
+            cond_outputs = tracker_state["output_dict"]["cond_frame_outputs"]
+            if len(cond_outputs) == 0:
+                continue  # never-prune-nonempty invariant: keep at least one
+            # always keep the FIRST cond frame of the state (the prompt /
+            # annotation frame that started tracking; also what the
+            # predictor's `first_ann_frame_idx` fallback and default
+            # propagation start read)
+            kept_frame_inds = {next(iter(cond_outputs))}
+            if reverse:
+                # tracking backwards: the cond frames closest to the reverse
+                # front (and to any future reverse propagation) are the
+                # lowest-index ones
+                kept_frame_inds.update(sorted(cond_outputs)[:num_newest_to_keep])
+                # memories are read from frame_idx+1 onwards, so cond frames
+                # at/after frame_idx + horizon are no longer needed
+                stale_frame_inds = [
+                    t
+                    for t in cond_outputs
+                    if t >= frame_idx + horizon and t not in kept_frame_inds
+                ]
+            else:
+                # tracking forwards: the cond frames closest to the forward
+                # front (and to any future forward propagation) are the
+                # highest-index ones
+                kept_frame_inds.update(sorted(cond_outputs)[-num_newest_to_keep:])
+                # memories are read from frame_idx-1 backwards, so cond frames
+                # at/before frame_idx - horizon are no longer needed
+                stale_frame_inds = [
+                    t
+                    for t in cond_outputs
+                    if t <= frame_idx - horizon and t not in kept_frame_inds
+                ]
+            if not stale_frame_inds:
+                continue
+            for stale_frame_idx in stale_frame_inds:
+                del cond_outputs[stale_frame_idx]
+            # the per-object cond slices share the same tensor storage as the
+            # batched entries above; drop them in lockstep so both storages
+            # stay consistent about which conditioning frames exist
+            output_dict_per_obj = tracker_state["output_dict_per_obj"]
+            for obj_output_dict in output_dict_per_obj.values():
+                obj_cond_outputs = obj_output_dict["cond_frame_outputs"]
+                for stale_frame_idx in stale_frame_inds:
+                    obj_cond_outputs.pop(stale_frame_idx, None)
+            # discard stale consolidated-frame bookkeeping for the pruned
+            # frames so a later re-propagation never treats a pruned frame as
+            # a consolidated conditioning one (the predictor asserts
+            # `consolidated_frame_inds["cond_frame_outputs"]` is a subset of
+            # the cond keys and reads stored outputs for consolidated frames)
+            consolidated_inds = tracker_state["consolidated_frame_inds"][
+                "cond_frame_outputs"
+            ]
+            for stale_frame_idx in stale_frame_inds:
+                consolidated_inds.discard(stale_frame_idx)
+            # drop the pruned frames' registered point/mask inputs in lockstep
+            # as well: their conditioning outputs and consolidated bookkeeping
+            # are gone, and `propagate_in_video_preflight` asserts that the
+            # consolidated frame indices equal exactly the frames with
+            # point/mask inputs (sam3_tracking_predictor.py:728-739). These
+            # inputs were consumed when the pruned cond frames' memories were
+            # encoded and have no remaining reader on the forward det-track
+            # path (input dicts are only read for the current interaction
+            # frame, by the preflight bookkeeping assert, and by the
+            # interactive refinement / object-removal paths).
+            for obj_inputs in tracker_state["point_inputs_per_obj"].values():
+                for stale_frame_idx in stale_frame_inds:
+                    obj_inputs.pop(stale_frame_idx, None)
+            for obj_inputs in tracker_state["mask_inputs_per_obj"].values():
+                for stale_frame_idx in stale_frame_inds:
+                    obj_inputs.pop(stale_frame_idx, None)
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):
         """

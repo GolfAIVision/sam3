@@ -84,6 +84,50 @@ Keep the first + most recent K (e.g. 3) detection-conditioning frames per state,
 the rest. Upstream warns this affects tracking (#408: "some logic is needed to decide
 which ones to keep"); measure quality before shipping.
 
+> **Implementation addendum (flag-gated, default-off).** Implemented as
+> `Sam3VideoBase._prune_tracker_cond_outputs` (sam3/model/sam3_video_base.py), called
+> from the det-track step next to the P2 non-cond prune, gated by the additive
+> `prune_tracker_cond_outputs` kwarg on `Sam3VideoBase` and
+> `build_sam3_video_model` (default `None` = legacy unbounded conditioning memory,
+> bit-identical). Corrections vs. the sketch above:
+> - **K correction:** K = `max_cond_frames_in_attn + 2` (= 6 with the shipped
+>   `max_cond_frames_in_attn=4`, model_builder.py), **not** the suggested 3. The
+>   memory attention selects up to `max_cond_frames_in_attn` conditioning frames
+>   temporally closest to the current frame (`select_closest_cond_frames`,
+>   sam3_tracker_utils.py:270-319); tracking forwards these are the
+>   `max_cond_frames_in_attn` largest cond indices, so keeping only the 3 newest
+>   would prune a frame the attention would have selected and change tracking.
+>   K = 4 + 2 keeps the selectable set plus margin.
+> - **Prune horizon:** entries are deleted only when `t <= frame_idx -
+>   max_obj_ptrs_in_encoder` (reverse-symmetric: `t >= frame_idx +
+>   max_obj_ptrs_in_encoder`) AND outside the kept set. The obj-ptr loop and the
+>   mask-attention window never read cond entries more than
+>   `max_obj_ptrs_in_encoder - 1` frames behind the current frame
+>   (sam3_tracker_base.py:645-656, :724-739), so pruned entries are unread on the
+>   forward pass -> opt-in forward bit-identity by construction.
+> - **Invariants:** keep the FIRST cond frame (protects the predictor's
+>   `first_ann_frame_idx` fallback / default propagation start,
+>   sam3_tracking_predictor.py:745-766) and never prune a state's cond dict to
+>   empty (guards at sam3_tracker_base.py:591 and sam3_tracking_predictor.py:809);
+>   per-object cond dicts are pruned in lockstep, stale
+>   `consolidated_frame_inds["cond_frame_outputs"]` entries are discarded, and the
+>   pruned frames' registered point/mask inputs are dropped in lockstep (required by
+>   the preflight bookkeeping assert `consolidated_frame_inds == frames with
+>   point/mask inputs`, sam3_tracking_predictor.py:728-739 -- caught by the real-data
+>   flag-on verification run; the dropped inputs were already consumed when the
+>   pruned cond frames' memories were encoded).
+> - **Default-off rationale:** forward det-track runs are bit-identical by
+>   construction with the flag on, but the P3 quality gate still applies to
+>   (1) reverse re-propagation composition (the temporally-closest selection can
+>   reach beyond the kept set on sparse cond timelines in reverse) and (2)
+>   interactive refinement on pruned cond frames. Both need a tracking-quality
+>   metric (HOTA/MOTA) before the flag is enabled in production, so it ships
+>   opt-in only.
+> - **Measured motivation (real 64-frame testset, prompt "person"):** cond keys
+>   [0, 16, 32, 48] after 64 frames (~1.9 MiB GPU + ~2.85 MiB host per cond event
+>   per state) -- unbounded on long videos; bounded at 1 + K events with the flag
+>   on.
+
 ### P7 / P8 / W5 - wrapper-side complements
 - `remove_object(inference_state, obj_id, is_user_action=False)` (~L1294) drops emptied
   tracker states and cache entries; expire objects not seen for N frames (mind

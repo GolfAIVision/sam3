@@ -664,6 +664,12 @@ def build_sam3_video_model(
     # `max_num_objects` and kept at its previous effective default (16) so that
     # raising the object cap does not inflate the compilation warm-up 8x.
     num_obj_for_compile: int = 16,
+    # P3: opt-in prune of stale tracker conditioning-frame outputs (see
+    # `Sam3VideoBase._prune_tracker_cond_outputs`). None/False (default)
+    # keeps the legacy unbounded conditioning memory (bit-identical); True
+    # bounds conditioning state at the first cond frame plus the K newest
+    # (K = max_cond_frames_in_attn + 2) per tracker state.
+    prune_tracker_cond_outputs=None,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
@@ -745,6 +751,7 @@ def build_sam3_video_model(
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
             num_obj_for_compile=num_obj_for_compile,
+            prune_tracker_cond_outputs=prune_tracker_cond_outputs,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
@@ -774,6 +781,7 @@ def build_sam3_video_model(
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
             num_obj_for_compile=num_obj_for_compile,
+            prune_tracker_cond_outputs=prune_tracker_cond_outputs,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
