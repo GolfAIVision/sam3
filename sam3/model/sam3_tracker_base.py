@@ -643,6 +643,13 @@ class Sam3TrackerBase(torch.nn.Module):
                             prev_frame_idx = prev_frame_idx + (t_rel - 2) * r
 
                 out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                if out is not None and "maskmem_features" not in out:
+                    # Slim pool-metadata-only entry (retained by the P2 prune for
+                    # obj-ptr selection): its heavy maskmem tensors are pruned,
+                    # so treat it as a missing memory for the mask-attention
+                    # window (the obj-ptr loop below still uses the retained
+                    # metadata).
+                    out = None
                 if out is None:
                     # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
                     # frames, we still attend to it as if it's a non-conditioning frame.

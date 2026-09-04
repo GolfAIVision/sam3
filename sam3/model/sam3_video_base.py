@@ -316,26 +316,48 @@ class Sam3VideoBase(nn.Module):
         """
         P2: rolling-window prune of the tracker's non-conditioning frame outputs.
 
-        After each tracked frame, drop `non_cond_frame_outputs` entries (and their
-        per-object mirrors in `output_dict_per_obj`) that fall outside a window of
-        `max(num_maskmem + 2, max_obj_ptrs_in_encoder)` frames around the current
-        frame in the tracking direction, across ALL tracker states (the det-track
-        path maintains a list of states). The window must cover the obj-ptr
-        selection horizon (`max_obj_ptrs_in_encoder`: `frame_filter` scans
-        non-conditioning outputs backwards to collect up to `max_obj_ptrs_in_encoder
-        - 1` pointer-memory candidates), otherwise the pool of object pointers
-        shrinks and tracking behavior changes. Only memories older than that
-        horizon are dropped, so each tracker state stays O(window) instead of
-        O(video). Conditioning (`cond_frame_outputs`) entries are left untouched.
-        Stale `consolidated_frame_inds` entries of pruned frames are discarded so
-        the tracker's propagation never looks up a pruned output.
+        After each tracked frame, replace `non_cond_frame_outputs` entries (and
+        their per-object mirrors in `output_dict_per_obj`) that fall outside a
+        window of `max(num_maskmem + 2, max_obj_ptrs_in_encoder)` frames around
+        the current frame in the tracking direction, across ALL tracker states
+        (the det-track path maintains a list of states), with slim pool-metadata
+        entries, and drop every heavy tensor (maskmem_features, pred_masks,
+        maskmem_pos_enc, ...). The window must cover the obj-ptr selection
+        horizon, otherwise the pool of object pointers shrinks and tracking
+        behavior changes. Conditioning (`cond_frame_outputs`) entries are left
+        untouched. Stale `consolidated_frame_inds` entries of pruned frames are
+        discarded so the tracker's propagation never treats a pruned frame as a
+        consolidated one.
 
-        Accepted caveat (controller decision; OPTIMIZATION_PLAN.md patch P2):
-        re-propagating in the REVERSE direction after a forward pass reads
-        forward-era memories pruned by the forward pass in its first frames, so
-        mixed-direction runs may drift vs unbounded memory. This is accepted for
-        the long-video memory optimization; forward-only det-track remains
-        bit-identical to the unpruned baseline.
+        Slim pool-metadata retention: the obj-ptr selection is CANDIDATE-COUNT
+        based, not distance based -- `frame_filter` (sam3_tracker_base.py) scans
+        non-conditioning outputs backwards until it collects
+        `max_obj_ptrs_in_encoder - 1` candidates with `eff_iou_score >
+        mf_threshold`, with NO distance cap, so on low-score runs it can reach
+        arbitrarily far beyond the window. The pool selection feeds BOTH the
+        obj-ptr loop (reads `obj_ptr`) AND the mask-attention window
+        (`valid_indices[-num_maskmem+1:]` reads `maskmem_features` /
+        `maskmem_pos_enc` of the selected frames). To keep tracking bit-exact
+        vs unbounded memory, pruned frames therefore retain exactly the keys
+        the selection consumes: `eff_iou_score` (frame_filter), `obj_ptr`
+        (pointer loop), `object_score_logits` / `iou_score` (so
+        `eff_iou_score` can be recalculated identically on object removal), and
+        `maskmem_features` / `maskmem_pos_enc` (mask-attention window; the
+        per-frame pos_enc entries are views of the state-level constant, so
+        only `maskmem_features` is bulky). `pred_masks` is consumed by neither
+        propagation path and stays fully pruned. Scaling: GPU-heavy state stays
+        O(window); the retained metadata grows O(video) at ~1 KB/object/frame
+        on the GPU (obj_ptr-dominated) plus ~512 KiB/object/frame of
+        `maskmem_features` on the HOST (offloaded by
+        `offload_tracker_state_to_cpu=True`, i.e. zero GPU cost -- the same
+        host-side trade-off the plan's P4 patch makes).
+
+        Reverse re-propagation note (supersedes the earlier accepted-drift
+        caveat): because the pool-selected frames retain their maskmem
+        features, re-propagating in the REVERSE direction after a forward pass
+        reads the same memory contents as unbounded memory; mixed-direction
+        runs remain bit-identical. Only `pred_masks` of pruned frames are
+        unavailable, which no propagation path reads.
         """
         # cover both the memory-attention window (num_maskmem) and the obj-ptr
         # selection horizon (max_obj_ptrs_in_encoder), plus a small margin
@@ -356,20 +378,58 @@ class Sam3VideoBase(nn.Module):
                 ]
             if not stale_frame_inds:
                 continue
+            # slim-retention is idempotent: only frames still carrying heavy
+            # tensors are converted (once per frame), so the per-frame work and
+            # the per-object loops below stay O(newly pruned), not O(video)
+            newly_stale_frame_inds = []
             for stale_frame_idx in stale_frame_inds:
-                del non_cond_outputs[stale_frame_idx]
-            # the per-object slices share the same tensor storage as the entries
-            # above, so they must be dropped as well to actually free the memory
+                heavy_out = non_cond_outputs[stale_frame_idx]
+                if "pred_masks" not in heavy_out:
+                    continue  # already slim-retained
+                newly_stale_frame_inds.append(stale_frame_idx)
+                # keep exactly the keys the obj-ptr selection and the
+                # mask-attention window consume (see docstring); `pred_masks`
+                # is read by no propagation path and stays pruned
+                non_cond_outputs[stale_frame_idx] = {
+                    key: heavy_out[key]
+                    for key in (
+                        "obj_ptr",
+                        "object_score_logits",
+                        "iou_score",
+                        "eff_iou_score",
+                        "maskmem_features",
+                        "maskmem_pos_enc",
+                    )
+                    if key in heavy_out
+                }
+            if not newly_stale_frame_inds:
+                continue
+            # the per-object slices share the same tensor storage as the batched
+            # entries above, so mirroring them costs no extra GPU memory while
+            # keeping both storages consistent about which frames exist
             output_dict_per_obj = tracker_state["output_dict_per_obj"]
             for obj_output_dict in output_dict_per_obj.values():
                 obj_non_cond_outputs = obj_output_dict["non_cond_frame_outputs"]
-                for stale_frame_idx in stale_frame_inds:
-                    obj_non_cond_outputs.pop(stale_frame_idx, None)
+                for stale_frame_idx in newly_stale_frame_inds:
+                    obj_out = obj_non_cond_outputs.get(stale_frame_idx)
+                    if obj_out is None or "pred_masks" not in obj_out:
+                        continue
+                    obj_non_cond_outputs[stale_frame_idx] = {
+                        key: obj_out[key]
+                        for key in (
+                            "obj_ptr",
+                            "object_score_logits",
+                            "iou_score",
+                            "maskmem_features",
+                            "maskmem_pos_enc",
+                        )
+                        if key in obj_out
+                    }
             # discard stale consolidated-frame bookkeeping for the pruned frames
             consolidated_inds = tracker_state["consolidated_frame_inds"][
                 "non_cond_frame_outputs"
             ]
-            for stale_frame_idx in stale_frame_inds:
+            for stale_frame_idx in newly_stale_frame_inds:
                 consolidated_inds.discard(stale_frame_idx)
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):

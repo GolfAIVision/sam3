@@ -875,13 +875,42 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         Split a multi-object output into per-object output slices and add them into
         `output_dict_per_obj`. The resulting slices share the same tensor storage.
         """
-        maskmem_features = current_out["maskmem_features"]
+        maskmem_features = current_out.get("maskmem_features")
+        if maskmem_features is not None:
+            assert isinstance(maskmem_features, torch.Tensor)
+
+        output_dict_per_obj = inference_state["output_dict_per_obj"]
+
+        if "pred_masks" not in current_out:
+            # Slim pool-metadata entry (see Sam3VideoBase._prune_tracker_non_cond_outputs):
+            # retain only the per-object slices of the retained keys, which
+            # alias the batched ones (no extra GPU memory).
+            for obj_idx, obj_output_dict in output_dict_per_obj.items():
+                obj_slice = slice(obj_idx, obj_idx + 1)
+                obj_out = {
+                    "obj_ptr": current_out["obj_ptr"][obj_slice],
+                    "object_score_logits": current_out["object_score_logits"][
+                        obj_slice
+                    ],
+                }
+                if "iou_score" in current_out:
+                    obj_out["iou_score"] = current_out["iou_score"][obj_slice]
+                if "maskmem_features" in current_out:
+                    obj_out["maskmem_features"] = current_out["maskmem_features"][
+                        obj_slice
+                    ]
+                if "maskmem_pos_enc" in current_out:
+                    obj_out["maskmem_pos_enc"] = [
+                        x[obj_slice] for x in current_out["maskmem_pos_enc"]
+                    ]
+                obj_output_dict[storage_key][frame_idx] = obj_out
+            return
+
         assert maskmem_features is None or isinstance(maskmem_features, torch.Tensor)
 
         maskmem_pos_enc = current_out["maskmem_pos_enc"]
         assert maskmem_pos_enc is None or isinstance(maskmem_pos_enc, list)
 
-        output_dict_per_obj = inference_state["output_dict_per_obj"]
         for obj_idx, obj_output_dict in output_dict_per_obj.items():
             obj_slice = slice(obj_idx, obj_idx + 1)
             obj_out = {
@@ -1247,6 +1276,34 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         # Step 3: For packed tensor storage, we index the remaining ids and rebuild the per-object slices.
         def _slice_state(output_dict, storage_key):
             for frame_idx, out in output_dict[storage_key].items():
+                if "pred_masks" not in out:
+                    # Slim pool-metadata entry (see
+                    # Sam3VideoBase._prune_tracker_non_cond_outputs): re-slice
+                    # the retained tensors so they stay consistent with the
+                    # remaining objects, and recalculate `eff_iou_score`
+                    # exactly as for full entries.
+                    out["obj_ptr"] = out["obj_ptr"][remain_old_obj_inds]
+                    out["object_score_logits"] = out["object_score_logits"][
+                        remain_old_obj_inds
+                    ]
+                    if "iou_score" in out:
+                        out["iou_score"] = out["iou_score"][remain_old_obj_inds]
+                    if self.use_memory_selection and "eff_iou_score" in out:
+                        out["eff_iou_score"] = self.cal_mem_score(
+                            out["object_score_logits"], out["iou_score"]
+                        )  # recalculate the memory frame score
+                    if "maskmem_features" in out:
+                        out["maskmem_features"] = out["maskmem_features"][
+                            remain_old_obj_inds
+                        ]
+                    if "maskmem_pos_enc" in out:
+                        out["maskmem_pos_enc"] = [
+                            x[remain_old_obj_inds] for x in out["maskmem_pos_enc"]
+                        ]
+                    self._add_output_per_object(
+                        inference_state, frame_idx, out, storage_key
+                    )
+                    continue
                 out["maskmem_features"] = out["maskmem_features"][remain_old_obj_inds]
                 out["maskmem_pos_enc"] = [
                     x[remain_old_obj_inds] for x in out["maskmem_pos_enc"]
