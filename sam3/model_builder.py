@@ -658,9 +658,12 @@ def build_sam3_video_model(
     # W4: cap on the number of tracked objects (masklets) across all GPUs; new
     # detections are dropped by score once the cap is hit. The previous
     # effective default was unlimited (10000), which unbounded the tracker
-    # state memory on generic prompts. (Note: with compile=True, the
-    # compilation warm-up scales with this cap via `num_obj_for_compile`.)
+    # state memory on generic prompts.
     max_num_objects: int = 128,
+    # W4: number of objects used to warm up torch.compile, decoupled from
+    # `max_num_objects` and kept at its previous effective default (16) so that
+    # raising the object cap does not inflate the compilation warm-up 8x.
+    num_obj_for_compile: int = 16,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
@@ -741,6 +744,7 @@ def build_sam3_video_model(
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
+            num_obj_for_compile=num_obj_for_compile,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
@@ -769,6 +773,7 @@ def build_sam3_video_model(
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             max_num_objects=max_num_objects,
+            num_obj_for_compile=num_obj_for_compile,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),

@@ -69,6 +69,11 @@ class Sam3VideoBase(nn.Module):
         fill_hole_area=16,
         # The maximum number of objects (masklets) to track across all GPUs (for no limit, set it to -1)
         max_num_objects=-1,
+        # Number of objects used to warm up torch.compile (W4: decoupled from
+        # `max_num_objects` so that raising the object cap does not inflate the
+        # compilation warm-up; when None, it is derived from `max_num_objects`,
+        # which reproduces the pre-W4 behavior for direct users of this class)
+        num_obj_for_compile=None,
         # P4: whether to offload the tracker inference states to CPU memory
         # (maskmem features and predicted masks are stored on the host and
         # re-uploaded when read by the memory attention, which already handles
@@ -122,10 +127,12 @@ class Sam3VideoBase(nn.Module):
 
         # the maximum object number
         if max_num_objects > 0:
-            num_obj_for_compile = math.ceil(max_num_objects / self.world_size)
+            derived_num_obj_for_compile = math.ceil(max_num_objects / self.world_size)
         else:
             max_num_objects = 10000  # no limit
-            num_obj_for_compile = 16
+            derived_num_obj_for_compile = 16
+        if num_obj_for_compile is None:
+            num_obj_for_compile = derived_num_obj_for_compile
         logger.info(f"setting {max_num_objects=} and {num_obj_for_compile=}")
         self.max_num_objects = max_num_objects
         self.num_obj_for_compile = num_obj_for_compile
