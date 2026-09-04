@@ -311,15 +311,21 @@ class Sam3VideoBase(nn.Module):
 
         After each tracked frame, drop `non_cond_frame_outputs` entries (and their
         per-object mirrors in `output_dict_per_obj`) that fall outside a window of
-        `num_maskmem + 2` frames around the current frame in the tracking
-        direction, across ALL tracker states (the det-track path maintains a list
-        of states). Only memories older than the `num_maskmem`-frame memory
-        attention window are dropped, so each tracker state stays O(window)
-        instead of O(video). Conditioning (`cond_frame_outputs`) entries are left
-        untouched. Stale `consolidated_frame_inds` entries of pruned frames are
-        discarded so the tracker's propagation never looks up a pruned output.
+        `max(num_maskmem + 2, max_obj_ptrs_in_encoder)` frames around the current
+        frame in the tracking direction, across ALL tracker states (the det-track
+        path maintains a list of states). The window must cover the obj-ptr
+        selection horizon (`max_obj_ptrs_in_encoder`: `frame_filter` scans
+        non-conditioning outputs backwards to collect up to `max_obj_ptrs_in_encoder
+        - 1` pointer-memory candidates), otherwise the pool of object pointers
+        shrinks and tracking behavior changes. Only memories older than that
+        horizon are dropped, so each tracker state stays O(window) instead of
+        O(video). Conditioning (`cond_frame_outputs`) entries are left untouched.
+        Stale `consolidated_frame_inds` entries of pruned frames are discarded so
+        the tracker's propagation never looks up a pruned output.
         """
-        window = self.tracker.num_maskmem + 2
+        # cover both the memory-attention window (num_maskmem) and the obj-ptr
+        # selection horizon (max_obj_ptrs_in_encoder), plus a small margin
+        window = max(self.tracker.num_maskmem + 2, self.tracker.max_obj_ptrs_in_encoder)
         for tracker_state in tracker_states_local:
             non_cond_outputs = tracker_state["output_dict"]["non_cond_frame_outputs"]
             if reverse:
@@ -457,9 +463,7 @@ class Sam3VideoBase(nn.Module):
         # `_get_image_feature` and feeds it to the memory encoder, which requires
         # it on the GPU.
         feature_cache[frame_idx] = (
-            input_batch.img_batch[frame_idx].to(
-                device=self.device, non_blocking=True
-            ),
+            input_batch.img_batch[frame_idx].to(device=self.device, non_blocking=True),
             backbone_cache,
         )
         # remove from `feature_cache` old features to save GPU memory
