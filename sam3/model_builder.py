@@ -655,6 +655,12 @@ def build_sam3_video_model(
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
     apply_temporal_disambiguation: bool = True,
+    # W4: cap on the number of tracked objects (masklets) across all GPUs; new
+    # detections are dropped by score once the cap is hit. The previous
+    # effective default was unlimited (10000), which unbounded the tracker
+    # state memory on generic prompts. (Note: with compile=True, the
+    # compilation warm-up scales with this cap via `num_obj_for_compile`.)
+    max_num_objects: int = 128,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
@@ -734,6 +740,7 @@ def build_sam3_video_model(
             recondition_every_nth_frame=16,
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
+            max_num_objects=max_num_objects,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
@@ -761,6 +768,7 @@ def build_sam3_video_model(
             recondition_every_nth_frame=0,
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
+            max_num_objects=max_num_objects,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
