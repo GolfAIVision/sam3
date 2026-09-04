@@ -281,6 +281,12 @@ class Sam3VideoBase(nn.Module):
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][
                 frame_idx
             ].update(dict(zip(tracker_obj_ids, tracker_obj_scores_global)))
+
+        # P2: prune tracker non-conditioning outputs that fell out of the memory
+        # window, across all tracker states (see `_prune_tracker_non_cond_outputs`)
+        self._prune_tracker_non_cond_outputs(
+            tracker_states_local_new, frame_idx, reverse
+        )
         return (
             obj_id_to_mask,  # a dict: obj_id --> output mask
             obj_id_to_prob_mask,  # a dict: obj_id --> output prob mask
@@ -290,6 +296,55 @@ class Sam3VideoBase(nn.Module):
             frame_stats,
             tracker_obj_scores_global,  # a dict: obj_id --> tracker frame-level scores
         )
+
+    def _prune_tracker_non_cond_outputs(
+        self, tracker_states_local: List[Any], frame_idx: int, reverse: bool
+    ):
+        """
+        P2: rolling-window prune of the tracker's non-conditioning frame outputs.
+
+        After each tracked frame, drop `non_cond_frame_outputs` entries (and their
+        per-object mirrors in `output_dict_per_obj`) that fall outside a window of
+        `num_maskmem + 2` frames around the current frame in the tracking
+        direction, across ALL tracker states (the det-track path maintains a list
+        of states). Only memories older than the `num_maskmem`-frame memory
+        attention window are dropped, so each tracker state stays O(window)
+        instead of O(video). Conditioning (`cond_frame_outputs`) entries are left
+        untouched. Stale `consolidated_frame_inds` entries of pruned frames are
+        discarded so the tracker's propagation never looks up a pruned output.
+        """
+        window = self.tracker.num_maskmem + 2
+        for tracker_state in tracker_states_local:
+            non_cond_outputs = tracker_state["output_dict"]["non_cond_frame_outputs"]
+            if reverse:
+                # tracking backwards: memories are read from frame_idx+1 onwards,
+                # so frames at/after frame_idx + window are no longer needed
+                stale_frame_inds = [
+                    f for f in non_cond_outputs if f >= frame_idx + window
+                ]
+            else:
+                # tracking forwards: memories are read from frame_idx-1 backwards,
+                # so frames at/before frame_idx - window are no longer needed
+                stale_frame_inds = [
+                    f for f in non_cond_outputs if f <= frame_idx - window
+                ]
+            if not stale_frame_inds:
+                continue
+            for stale_frame_idx in stale_frame_inds:
+                del non_cond_outputs[stale_frame_idx]
+            # the per-object slices share the same tensor storage as the entries
+            # above, so they must be dropped as well to actually free the memory
+            output_dict_per_obj = tracker_state["output_dict_per_obj"]
+            for obj_output_dict in output_dict_per_obj.values():
+                obj_non_cond_outputs = obj_output_dict["non_cond_frame_outputs"]
+                for stale_frame_idx in stale_frame_inds:
+                    obj_non_cond_outputs.pop(stale_frame_idx, None)
+            # discard stale consolidated-frame bookkeeping for the pruned frames
+            consolidated_inds = tracker_state["consolidated_frame_inds"][
+                "non_cond_frame_outputs"
+            ]
+            for stale_frame_idx in stale_frame_inds:
+                consolidated_inds.discard(stale_frame_idx)
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):
         """
