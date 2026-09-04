@@ -320,14 +320,17 @@ class Sam3VideoBase(nn.Module):
         their per-object mirrors in `output_dict_per_obj`) that fall outside a
         window of `max(num_maskmem + 2, max_obj_ptrs_in_encoder)` frames around
         the current frame in the tracking direction, across ALL tracker states
-        (the det-track path maintains a list of states), with slim pool-metadata
-        entries, and drop every heavy tensor (maskmem_features, pred_masks,
-        maskmem_pos_enc, ...). The window must cover the obj-ptr selection
-        horizon, otherwise the pool of object pointers shrinks and tracking
-        behavior changes. Conditioning (`cond_frame_outputs`) entries are left
-        untouched. Stale `consolidated_frame_inds` entries of pruned frames are
-        discarded so the tracker's propagation never treats a pruned frame as a
-        consolidated one.
+        (the det-track path maintains a list of states), with slim entries that
+        retain the pool metadata listed below (`eff_iou_score`, `obj_ptr`,
+        `object_score_logits`, `iou_score`, `maskmem_features`,
+        `maskmem_pos_enc`) and drop every other heavy tensor (`pred_masks` and
+        other bulky entries not consumed by propagation). The window must cover
+        the obj-ptr selection horizon, otherwise the pool of object pointers
+        shrinks and tracking behavior changes. Conditioning
+        (`cond_frame_outputs`) entries are left untouched. Stale
+        `consolidated_frame_inds` entries of pruned frames are discarded so the
+        tracker's propagation never treats a pruned frame as a consolidated
+        one.
 
         Slim pool-metadata retention: the obj-ptr selection is CANDIDATE-COUNT
         based, not distance based -- `frame_filter` (sam3_tracker_base.py) scans
