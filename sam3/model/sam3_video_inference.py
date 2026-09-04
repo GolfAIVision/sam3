@@ -36,6 +36,7 @@ class Sam3VideoInference(Sam3VideoBase):
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         compile_model=False,
+        cached_frame_outputs_window=8,
         **kwargs,
     ):
         """
@@ -43,12 +44,17 @@ class Sam3VideoInference(Sam3VideoBase):
         hotstart_unmatch_thresh: int, remove the object if it has this many unmatched frames within its hotstart_delay period.
             If `hotstart_delay` is set to 0, this parameter is ignored.
         hotstart_dup_thresh: int, remove the object if it has overlapped with another object this many frames within its hotstart_delay period.
+        cached_frame_outputs_window: int, the maximum number of recent frames whose outputs are kept in
+            `inference_state["cached_frame_outputs"]` (P1: a rolling window instead of the whole video, which is
+            only read by the interactive refinement paths, which degrade gracefully on cache misses). Set it to
+            0 (or negative) to disable caching of frame outputs entirely.
         """
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_mean = image_mean
         self.image_std = image_std
         self.compile_model = compile_model
+        self.cached_frame_outputs_window = cached_frame_outputs_window
 
     @torch.inference_mode()
     def init_state(
@@ -560,20 +566,33 @@ class Sam3VideoInference(Sam3VideoBase):
                 if obj_id in filtered_obj_id_to_mask:
                     del filtered_obj_id_to_mask[obj_id]
 
-        inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
+        # P1: cap the output cache with a rolling window (or disable it entirely).
+        # The cache is only read by the interactive refinement paths
+        # (`_build_tracker_output` and the `propagation_fetch` branch), which both
+        # handle cache misses gracefully, so nothing else is affected.
+        window = self.cached_frame_outputs_window
+        if window is None or window <= 0:
+            return
+        cache = inference_state["cached_frame_outputs"]
+        cache[frame_idx] = filtered_obj_id_to_mask
+        # keep only the `window` most recently cached frames; dicts preserve
+        # insertion order, so this works for both tracking directions
+        excess = len(cache) - window
+        if excess > 0:
+            for old_frame_idx in list(cache.keys())[:excess]:
+                del cache[old_frame_idx]
 
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
     ):
-        assert (
-            "cached_frame_outputs" in inference_state
-            and frame_idx in inference_state["cached_frame_outputs"]
-        ), (
-            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
+        # P1: with the rolling-window output cache (or caching disabled), the
+        # requested frame may no longer be cached; degrade gracefully to the
+        # refined masks only instead of raising.
+        cached_outputs = inference_state.get("cached_frame_outputs", {}).get(
+            frame_idx, {}
         )
-        cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
-        obj_id_to_mask = cached_outputs.copy()
+        obj_id_to_mask = dict(cached_outputs)
 
         # Update with refined masks if provided
         if refined_obj_id_to_mask is not None:
