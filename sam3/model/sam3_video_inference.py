@@ -599,14 +599,21 @@ class Sam3VideoInference(Sam3VideoBase):
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
     ):
-        # P1: with the rolling-window output cache (or caching disabled), the
-        # requested frame may no longer be cached; degrade gracefully to the
-        # refined masks only instead of raising.
-        cached_outputs = inference_state.get("cached_frame_outputs", {}).get(
-            frame_idx, {}
+        # Loud guard per design: the interactive refinement paths
+        # (propagation_partial / add_tracker_new_points) must not silently
+        # produce an output missing the other objects of this frame when the
+        # rolling-window cache (P1) has evicted the frame -- fail loudly instead.
+        # (The propagation_fetch path reads the cache directly via `.get` and
+        # degrades gracefully by design.)
+        assert (
+            "cached_frame_outputs" in inference_state
+            and frame_idx in inference_state["cached_frame_outputs"]
+        ), (
+            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
         )
+        cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
-        obj_id_to_mask = dict(cached_outputs)
+        obj_id_to_mask = cached_outputs.copy()
 
         # Update with refined masks if provided
         if refined_obj_id_to_mask is not None:
