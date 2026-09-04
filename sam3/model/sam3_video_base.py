@@ -446,8 +446,14 @@ class Sam3VideoBase(nn.Module):
             "backbone_fpn": tracker_backbone_fpn,
         }
         backbone_cache["tracker_backbone_out"] = tracker_backbone_out
+        # P6: `img_batch` resides on the CPU; move only the consumed frame to the
+        # GPU here. The tracker reads this image from `feature_cache` via
+        # `_get_image_feature` and feeds it to the memory encoder, which requires
+        # it on the GPU.
         feature_cache[frame_idx] = (
-            input_batch.img_batch[frame_idx],
+            input_batch.img_batch[frame_idx].to(
+                device=self.device, non_blocking=True
+            ),
             backbone_cache,
         )
         # remove from `feature_cache` old features to save GPU memory

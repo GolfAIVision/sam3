@@ -16,7 +16,6 @@ from sam3.model.geometry_encoders import Prompt
 from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
-from sam3.model.utils.misc import copy_data_to_device
 from sam3.model.utils.autocast import bf16_autocast_context
 from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
@@ -145,7 +144,23 @@ class Sam3VideoInference(Sam3VideoBase):
         for i in range(len(stages)):
             stages[i] = convert_my_tensors(stages[i])
 
-        # construct the final `BatchedDatapoint` and cast to GPU
+        # P6: keep the whole-video `img_batch` on CPU (pinned, so that the
+        # per-frame H2D copies at the consumption sites can be async) instead of
+        # holding the entire video on the GPU. The consumed frame is moved to the
+        # GPU where it is read: in the detector call (`img_batch_all_stages`,
+        # indexed per frame inside the detector) and at the feature-cache write
+        # in `run_backbone_and_detection` (read by the tracker's memory encoder).
+        # Note: `find_inputs` (and the rest of the input batch) stay on the CPU
+        # as well, because the detector indexes the CPU-resident `img_batch` with
+        # `img_ids` from `find_inputs`; these inputs are tiny (scalar ids and
+        # empty prompt tensors per frame).
+        if isinstance(images, torch.Tensor):
+            if images.device.type != "cpu":
+                images = images.to(device="cpu")
+            if device.type == "cuda":
+                images = images.pin_memory()
+
+        # construct the final `BatchedDatapoint` (`img_batch` stays on CPU; see above)
         input_batch = BatchedDatapoint(
             img_batch=images,
             find_text_batch=find_text_batch,
@@ -153,7 +168,6 @@ class Sam3VideoInference(Sam3VideoBase):
             find_targets=[None] * num_frames,
             find_metadatas=[None] * num_frames,
         )
-        input_batch = copy_data_to_device(input_batch, device, non_blocking=True)
         inference_state["input_batch"] = input_batch
 
         # construct the placeholder interactive prompts and tracking queries
