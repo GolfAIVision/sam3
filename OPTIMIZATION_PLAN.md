@@ -94,7 +94,7 @@ which ones to keep"); measure quality before shipping.
 >   `max_cond_frames_in_attn=4`, model_builder.py), **not** the suggested 3. The
 >   memory attention selects up to `max_cond_frames_in_attn` conditioning frames
 >   temporally closest to the current frame (`select_closest_cond_frames`,
->   sam3_tracker_utils.py:270-319); tracking forwards these are the
+>   sam3_tracker_utils.py:270-324); tracking forwards these are the
 >   `max_cond_frames_in_attn` largest cond indices, so keeping only the 3 newest
 >   would prune a frame the attention would have selected and change tracking.
 >   K = 4 + 2 keeps the selectable set plus margin.
@@ -125,8 +125,18 @@ which ones to keep"); measure quality before shipping.
 >   opt-in only.
 > - **Measured motivation (real 64-frame testset, prompt "person"):** cond keys
 >   [0, 16, 32, 48] after 64 frames (~1.9 MiB GPU + ~2.85 MiB host per cond event
->   per state) -- unbounded on long videos; bounded at 1 + K events with the flag
->   on.
+>   per state) -- unbounded on long videos. With the flag on, the bound is
+>   ~1 + K + horizon/cadence events per state
+>   (`horizon = max_obj_ptrs_in_encoder`), O(1) at any
+>   `recondition_every_nth_frame` cadence; exactly 1 + K = 7 only at the shipped
+>   cadence 16 (measured 9 events at cadence 2 -- the within-horizon cond events
+>   are legitimately retained).
+> - **Flag-on verification (same testset):** against the same-schedule unpruned
+>   control (identical `recondition_every_nth_frame` schedule), 0/64 frames
+>   mismatch with the flag on at cadence 4; against the shipped cadence-16
+>   baseline, 59/64 frames mismatch, but the flag-off cadence-4 control shows
+>   the identical divergence profile -- i.e. the divergence is attributable to
+>   the cadence change, not to the prune.
 
 ### P7 / P8 / W5 - wrapper-side complements
 - `remove_object(inference_state, obj_id, is_user_action=False)` (~L1294) drops emptied

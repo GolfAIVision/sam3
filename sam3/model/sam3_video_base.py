@@ -489,7 +489,7 @@ class Sam3VideoBase(nn.Module):
         Opt-in forward bit-identity by construction -- the forward det-track
         pass reads conditioning state only through:
 
-        - `select_closest_cond_frames` (sam3_tracker_utils.py:270-319), called
+        - `select_closest_cond_frames` (sam3_tracker_utils.py:270-324), called
           from `_prepare_memory_conditioned_features`
           (sam3_tracker_base.py:560-787) with
           `max_cond_frames_in_attn`: it selects at most
@@ -546,7 +546,11 @@ class Sam3VideoBase(nn.Module):
         [0, 16, 32, 48] after 64 frames) at ~1.9 MiB GPU (`pred_masks`,
         `obj_ptr`, logits) plus ~2.85 MiB host (`maskmem_features`, offloaded
         by `offload_tracker_state_to_cpu=True`) per event. With the flag on,
-        conditioning state is bounded at 1 + K events per state.
+        conditioning state is bounded at ~1 + K + horizon/cadence events
+        per state (`horizon = max_obj_ptrs_in_encoder`) -- O(1) at any
+        `recondition_every_nth_frame` cadence; exactly 1 + K = 7 only at
+        the shipped cadence 16 (measured 9 at cadence 2, the within-horizon
+        cond events legitimately retained).
         """
         max_cond_frame_num = self.tracker.max_cond_frames_in_attn
         if max_cond_frame_num < 0:
